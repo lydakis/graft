@@ -198,6 +198,7 @@ fn copies_are_made_compared_synced_and_landed() {
     std::fs::create_dir(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/lib.rs"), "fn one() {}\n\nfn two() {}\n").unwrap();
     std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "/target\n").unwrap();
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "-q", "-m", "first"]);
     let first = git(repo, &["rev-parse", "HEAD"]);
@@ -219,6 +220,11 @@ fn copies_are_made_compared_synced_and_landed() {
     std::fs::write(fix.join("src/lib.rs"), "fn one() {}\n\nfn two() { 2 }\n").unwrap();
     std::fs::write(fix.join("notes.txt"), "why\n").unwrap();
     std::fs::write(try_.join("src/lib.rs"), "fn one() { 1 }\n\nfn two() {}\n").unwrap();
+    // Build output git ignores is no change, in either copy.
+    for copy in [&fix, &try_] {
+        std::fs::create_dir_all(copy.join("target/debug")).unwrap();
+        std::fs::write(copy.join("target/debug/app"), "built\n").unwrap();
+    }
     assert_eq!(gft.run(&fix, &["changes"]), "A notes.txt\nM src/lib.rs\n");
     assert_eq!(gft.run(&fix, &["changes", "fix", "try"]), "A notes.txt\nM src/lib.rs\n");
     let listed = gft.run(&home, &["ls"]);

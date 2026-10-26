@@ -114,15 +114,18 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Changes { a, b } => {
             let (project, current) = here(&store)?;
-            let workspace = |name: Option<String>| -> Result<String> {
+            let workspace = |name: Option<String>| -> Result<(String, PathBuf)> {
                 match name.or(current.clone()) {
-                    Some(name) => Ok(copy(&project, &name)?.workspace.clone()),
-                    None => Ok(project.workspace.clone()),
+                    Some(name) => {
+                        let copy = copy(&project, &name)?;
+                        Ok((copy.workspace.clone(), copy.dir.clone()))
+                    }
+                    None => Ok((project.workspace.clone(), project.home.clone())),
                 }
             };
-            let a = workspace(a)?;
-            let b = b.map(|b| workspace(Some(b))).transpose()?;
-            for change in changes(&a, b.as_deref())? {
+            let (a, dir) = workspace(a)?;
+            let b = b.map(|b| workspace(Some(b)).map(|(b, _)| b)).transpose()?;
+            for change in changes(&a, b.as_deref(), &dir)? {
                 println!("{} {}", change.kind, change.path);
             }
             Ok(())
@@ -294,7 +297,7 @@ fn ls(store: &Store) -> Result<()> {
     println!("{}\t{}\t(home, {})", project.workspace, project.home.display(), project.branch);
     let mut changed: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for (name, copy) in &project.copies {
-        let paths = changes(&copy.workspace, None)?.into_iter().map(|change| change.path).collect();
+        let paths = changes(&copy.workspace, None, &copy.dir)?.into_iter().map(|change| change.path).collect();
         changed.insert(name, paths);
     }
     for (name, copy) in &project.copies {
@@ -351,7 +354,7 @@ fn undo(store: &Store, repo: &str, name: &str, steps: usize) -> Result<()> {
         sandfs(&["changes", &target.workspace, "--since", &copy.workspace, "--copy-to", path_str(&copy.dir)?])?;
     } else {
         // A snapshot from before a sync sits on another commit: the copy is made again.
-        sandfs(&["rm", "--unmount", &copy.workspace])?;
+        in_use(copy, sandfs(&["rm", "--unmount", &copy.workspace]))?;
         sandfs(&["fork", &target.workspace, path_str(&copy.dir)?, "--name", &copy.workspace])?;
     }
     // Snapshots newer than the one gone back to go; that one stays, to go back to again.
@@ -369,12 +372,27 @@ fn undo(store: &Store, repo: &str, name: &str, steps: usize) -> Result<()> {
     Ok(())
 }
 
+/// An unmount of `copy` refused because something works in it, said plainly.
+fn in_use<T>(copy: &Copy, result: Result<T>) -> Result<T> {
+    result.map_err(|err| {
+        if format!("{err:#}").contains("busy") {
+            anyhow::anyhow!(
+                "{} is in use: a shell or program is working in it (its folder or a file in it is open); \
+                 leave it, as with `cd ..`, and try again",
+                copy.dir.display()
+            )
+        } else {
+            err
+        }
+    })
+}
+
 fn sync(store: &Store, repo: &str, name: &str) -> Result<()> {
     save(store, repo, name, "before sync")?;
     let project = store.load(repo)?;
     let copy = copy(&project, name)?.clone();
     if mounted(&copy.workspace)?.is_some() {
-        sandfs(&["unmount", &copy.workspace])?;
+        in_use(&copy, sandfs(&["unmount", &copy.workspace]))?;
     }
     let moved = sandfs(&["update", &copy.workspace]);
     // Mounted again whatever happened, so a refused update leaves the copy as it was.
@@ -445,7 +463,7 @@ fn rm(store: &Store, repo: &str, name: &str) -> Result<()> {
     let project = store.load(repo)?;
     let copy = copy(&project, name)?;
     if mounted(&copy.workspace)?.is_some() {
-        sandfs(&["rm", "--unmount", &copy.workspace])?;
+        in_use(copy, sandfs(&["rm", "--unmount", &copy.workspace]))?;
     } else {
         sandfs(&["rm", &copy.workspace])?;
     }

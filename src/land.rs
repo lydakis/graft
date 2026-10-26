@@ -22,7 +22,7 @@ pub fn land(store: &Store, repo: &str, name: &str, message: Option<&str>, draft:
     let project = store.load(repo)?;
     let copy = crate::copy(&project, name)?.clone();
     crate::mount_copy(&copy)?;
-    let changed = changes(&copy.workspace, None)?;
+    let changed = changes(&copy.workspace, None, &copy.dir)?;
     if changed.is_empty() {
         bail!("{name} has no changes to land");
     }
