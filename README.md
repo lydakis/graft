@@ -102,7 +102,7 @@ gft rm cleanup
 
 ## Needs
 
-- A `sandfs` newer than 0.6.0, which moves a mounted workspace in place (until the next release, `cargo install --git https://github.com/lydakis/sandfs sandfs-cli`), and what it needs to mount: FUSE 3 on Linux, nothing on macOS.
+- What a mount needs: FUSE 3 on Linux, nothing on macOS. sandfs is built into `gft`, so it needn't be installed. Install Graft with `cargo install --git https://github.com/lydakis/graft`.
 - `git` and `curl`.
 - A GitHub token for `land`: `GITHUB_TOKEN` or `GH_TOKEN`, else whatever `gh auth token` gives (see [Configuration](#configuration)).
 
@@ -120,16 +120,15 @@ Graft has no config file; it reads these environment variables.
 | --- | --- | --- |
 | `GRAFT_HOME` | The folder where Graft keeps its notes. Wins over `XDG_DATA_HOME`. | unset |
 | `XDG_DATA_HOME` | Used when `GRAFT_HOME` is unset: notes go in `$XDG_DATA_HOME/graft`. | unset, so `~/.local/share/graft` |
-| `GRAFT_SANDFS` | The `sandfs` program to run (a path or a name). | `sandfs` on the `PATH` |
 | `GRAFT_GITHUB_API` | GitHub API base URL, for GitHub Enterprise or a stand-in server. A trailing `/` is ignored. | `https://api.github.com` |
 | `GITHUB_TOKEN` | Token that `land` uses with the API. Checked first. | unset |
 | `GH_TOKEN` | Same, checked when `GITHUB_TOKEN` is unset. | unset |
 
 Without either token, `land` runs `gh auth token` and uses what it prints; if that fails too, `land` stops with "no GitHub token". Only `land` needs a token. The token is passed to `curl` on its stdin, never on a command line.
 
-Graft also passes its environment on to `sandfs`, `git` and `curl`, so their own settings apply. In particular `sandfs` keeps its workspaces under `$SANDFS_HOME`, else `$XDG_DATA_HOME/sandfs`, else `~/.local/share/sandfs`. Setting `XDG_DATA_HOME` therefore moves both Graft's notes and sandfs's workspaces, while `GRAFT_HOME` moves only Graft's.
+sandfs's own settings apply too, and Graft passes its environment on to `git` and `curl`. In particular sandfs keeps its workspaces under `$SANDFS_HOME`, else `$XDG_DATA_HOME/sandfs`, else `~/.local/share/sandfs`, the same ones the `sandfs` command shows if it is installed. Setting `XDG_DATA_HOME` therefore moves both Graft's notes and sandfs's workspaces, while `GRAFT_HOME` moves only Graft's. Mounts are served by a process that stays after `gft` returns: `gft` itself, run again as `gft sandfs daemon`.
 
-The tests also read `GRAFT_REQUIRE_SANDFS` (fail instead of skipping when sandfs or a mount is missing); Graft itself doesn't.
+The tests also read `GRAFT_REQUIRE_MOUNT` (fail instead of skipping when a mount can't be made); Graft itself doesn't.
 
 ### Where Graft keeps state
 

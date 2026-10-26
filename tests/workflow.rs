@@ -1,9 +1,8 @@
 //! `gft` end to end: copies of a repository served from a folder, mounted by sandfs,
 //! landing on a small stand-in for GitHub's API.
 //!
-//! Needs `sandfs` (with `update`) and a working mount: on Linux FUSE 3, on macOS
-//! nothing. Skipped when either is missing, unless `GRAFT_REQUIRE_SANDFS` is set, as
-//! CI does. `GRAFT_SANDFS` names the sandfs binary to use.
+//! Needs a working mount: on Linux FUSE 3, on macOS nothing. Skipped without one,
+//! unless `GRAFT_REQUIRE_MOUNT` is set, as CI does.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -14,17 +13,15 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
-fn sandfs_available() -> bool {
-    let sandfs = std::env::var_os("GRAFT_SANDFS").unwrap_or_else(|| "sandfs".into());
-    let works = Command::new(&sandfs).args(["update", "--help"]).output().is_ok_and(|out| out.status.success());
+fn mounts() -> bool {
     let mounts = cfg!(target_os = "macos")
         || (Path::new("/dev/fuse").exists()
             && Command::new("fusermount3").arg("--version").output().is_ok_and(|out| out.status.success()));
-    if !(works && mounts) {
-        assert!(std::env::var_os("GRAFT_REQUIRE_SANDFS").is_none(), "sandfs is required but can't mount here");
-        eprintln!("skipping: no sandfs with `update`, or no mount");
+    if !mounts {
+        assert!(std::env::var_os("GRAFT_REQUIRE_MOUNT").is_none(), "a mount is required but can't be made here");
+        eprintln!("skipping: no mount");
     }
-    works && mounts
+    mounts
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -203,18 +200,18 @@ impl Gft {
 
 impl Drop for Gft {
     fn drop(&mut self) {
-        let sandfs = std::env::var_os("GRAFT_SANDFS").unwrap_or_else(|| "sandfs".into());
-        let list = Command::new(&sandfs).env("SANDFS_HOME", self.sandfs_home.path()).arg("list").output();
-        for line in list.map(|out| String::from_utf8_lossy(&out.stdout).into_owned()).unwrap_or_default().lines() {
-            let name = line.split('\t').next().unwrap_or_default();
-            let _ = Command::new(&sandfs).env("SANDFS_HOME", self.sandfs_home.path()).args(["unmount", name]).output();
+        let Ok(home) = sandfs::Home::at(self.sandfs_home.path()) else { return };
+        for workspace in home.workspaces().unwrap_or_default() {
+            if workspace.mounted.is_some() {
+                let _ = home.unmount(&workspace.name);
+            }
         }
     }
 }
 
 #[test]
 fn copies_are_made_compared_synced_and_landed() {
-    if !sandfs_available() {
+    if !mounts() {
         return;
     }
     // Served over file://, so sandfs treats it as a remote repository.
@@ -410,7 +407,7 @@ fn copies_are_made_compared_synced_and_landed() {
 
 #[test]
 fn copies_of_a_plain_folder_land_back_into_it() {
-    if !sandfs_available() {
+    if !mounts() {
         return;
     }
     let (api, _) = fake_github();
