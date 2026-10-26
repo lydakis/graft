@@ -34,22 +34,46 @@ pub struct Project {
     /// a repository on GitHub.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub folder: bool,
+    /// How many times copies of a plain folder took the folder as it was, which
+    /// numbers their bases.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub takes: u64,
     #[serde(default)]
     pub copies: BTreeMap<String, Copy>,
 }
 
 /// One working copy: a sandfs workspace mounted at `dir`.
+///
+/// Three things say where a copy stands, and each answers one question: `base` is
+/// what its files start from, `stacked` is the landed work it was made on top of,
+/// and `landed` is what it last put on GitHub. Landing builds on all three, so it
+/// never undoes what it doesn't know about.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Copy {
     pub dir: PathBuf,
     pub workspace: String,
-    /// The commit of the default branch the copy sits on; for a copy of a plain
-    /// folder, when the folder was copied, as `SECONDS.NANOS` since the Unix epoch.
+    /// What the copy's files start from, which `gft sync` moves: the commit of the
+    /// default branch it sits on. For a copy of a plain folder, `N@SECONDS`: the
+    /// project's Nth take of the folder as it was, SECONDS after the Unix epoch. Only
+    /// N tells two takes apart; the time is for people.
     pub base: String,
     /// The copy it was made from, if not the default branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
-    /// Its pull request, once landed.
+    /// The landing it was made on top of: when it was made from a copy that had
+    /// landed, that copy's landing as it was then. Its pull request is based on that
+    /// branch, and its first commit follows that landing rather than the branch's
+    /// newest commit, which the copy's files don't have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stacked: Option<Landing>,
+    /// What its last landing put on GitHub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed: Option<Landing>,
+    /// A landing whose commit is made but whose branch may not have moved to it yet,
+    /// kept until it has, so landing again after one cut short knows its own commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<Landing>,
+    /// Its pull request, once made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<Pr>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -59,17 +83,54 @@ pub struct Copy {
     pub next: u64,
 }
 
+/// A copy's changes as a landing left them on GitHub.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Landing {
+    /// The branch on GitHub.
+    pub branch: String,
+    /// The commit the landing left the branch at.
+    pub commit: String,
+    /// The base commit that commit was made on.
+    pub on: String,
+    /// Each file the landing carried, as `fingerprint` saw it, for `gft rm`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pr {
     pub number: u64,
     pub url: String,
-    /// The branch on GitHub that holds the copy's commits.
-    pub branch: String,
-    /// The base commit the last landing was made on.
-    pub landed_on: String,
-    /// Each file the last landing carried, as `fingerprint` saw it, for `gft rm`.
-    #[serde(default)]
-    pub landed: BTreeMap<String, String>,
+    /// Where Graft before 0.1 kept its last landing, read only to move it to
+    /// `Copy::landed`.
+    #[serde(default, skip_serializing, rename = "branch")]
+    old_branch: Option<String>,
+    #[serde(default, skip_serializing, rename = "landed_on")]
+    old_on: Option<String>,
+    #[serde(default, skip_serializing, rename = "landed")]
+    old_files: BTreeMap<String, String>,
+}
+
+impl Pr {
+    pub fn new(number: u64, url: String) -> Pr {
+        Pr { number, url, old_branch: None, old_on: None, old_files: BTreeMap::new() }
+    }
+}
+
+/// A project as read from its file, with a landing that Graft before 0.1 kept with
+/// the pull request moved to where it is kept now. That Graft didn't keep the commit
+/// it left the branch at, so the commit is left empty, for `land` to take the
+/// branch's as the copy's own.
+fn read(data: &[u8]) -> serde_json::Result<Project> {
+    let mut project: Project = serde_json::from_slice(data)?;
+    for copy in project.copies.values_mut() {
+        let Some(pr) = &mut copy.pr else { continue };
+        if let (Some(branch), Some(on), None) = (pr.old_branch.take(), pr.old_on.take(), &copy.landed) {
+            let files = std::mem::take(&mut pr.old_files);
+            copy.landed = Some(Landing { branch, commit: String::new(), on, files });
+        }
+    }
+    Ok(project)
 }
 
 /// A copy as it was at one moment, kept as an unmounted sandfs workspace.
@@ -80,6 +141,10 @@ pub struct Snapshot {
     pub note: String,
     /// Seconds since the Unix epoch.
     pub time: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Graft's home directory.
@@ -108,7 +173,7 @@ impl Store {
     pub fn load(&self, repo: &str) -> Result<Project> {
         let path = self.file(repo, "json");
         let data = std::fs::read(&path).with_context(|| format!("no project {repo}"))?;
-        serde_json::from_slice(&data).with_context(|| format!("reading {}", path.display()))
+        read(&data).with_context(|| format!("reading {}", path.display()))
     }
 
     fn save(&self, project: &Project) -> Result<()> {
@@ -154,7 +219,7 @@ impl Store {
                 let path = entry.path();
                 if path.extension().is_some_and(|ext| ext == "json") {
                     let data = std::fs::read(&path)?;
-                    found.push(serde_json::from_slice(&data).with_context(|| format!("reading {}", path.display()))?);
+                    found.push(read(&data).with_context(|| format!("reading {}", path.display()))?);
                 }
             }
         }
@@ -207,6 +272,21 @@ pub fn check_copy_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::check_copy_name;
+
+    #[test]
+    fn a_landing_kept_with_the_pull_request_moves_to_the_copy() {
+        let old = br#"{"repo": "o/n", "source": "s", "home": "/h", "workspace": "n", "branch": "main",
+            "copies": {"fix": {"dir": "/h+fix", "workspace": "n.fix", "base": "b2",
+                "pr": {"number": 3, "url": "u", "branch": "graft/fix", "landed_on": "b1",
+                    "landed": {"a.txt": "100644 abc"}}}}}"#;
+        let project = super::read(old).unwrap();
+        let copy = &project.copies["fix"];
+        let landed = copy.landed.as_ref().unwrap();
+        assert_eq!((landed.branch.as_str(), landed.commit.as_str(), landed.on.as_str()), ("graft/fix", "", "b1"));
+        assert_eq!(landed.files["a.txt"], "100644 abc");
+        let saved = serde_json::to_value(&project).unwrap();
+        assert_eq!(saved["copies"]["fix"]["pr"], serde_json::json!({"number": 3, "url": "u"}));
+    }
 
     fn refusal(name: &str) -> String {
         check_copy_name(name).unwrap_err().to_string()

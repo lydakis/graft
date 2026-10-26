@@ -114,6 +114,10 @@ enum Cmd {
         /// Open the pull request as a draft.
         #[arg(long)]
         draft: bool,
+        /// Land even though the branch on GitHub has commits this copy didn't land,
+        /// whose changes this landing then undoes.
+        #[arg(long)]
+        force: bool,
     },
     /// Delete copies, with their snapshots. Their pull requests stay as they are.
     /// A copy with changes that never landed (no pull request, or files changed since
@@ -205,12 +209,13 @@ fn run(cli: Cli) -> Result<()> {
             let (project, current) = here(&store)?;
             sync(&store, &project.repo, &which(name, current)?)
         }
-        Cmd::Land { name, message, body, body_file, draft } => {
+        Cmd::Land { name, message, body, body_file, draft, force } => {
             let (project, current) = here(&store)?;
             if project.folder {
-                if message.is_some() || body.is_some() || body_file.is_some() || draft {
+                if message.is_some() || body.is_some() || body_file.is_some() || draft || force {
                     bail!(
-                        "a copy of a folder lands into the folder; --message, --body and --draft are for pull requests"
+                        "a copy of a folder lands into the folder; --message, --body, --draft and --force are for \
+                         pull requests"
                     );
                 }
                 return land_folder(&store, &project, &which(name, current)?);
@@ -219,7 +224,8 @@ fn run(cli: Cli) -> Result<()> {
                 Some(path) => Some(read_body(&path)?),
                 None => body,
             };
-            land::land(&store, &project.repo, &which(name, current)?, message.as_deref(), body.as_deref(), draft)
+            let options = land::Options { message: message.as_deref(), body: body.as_deref(), draft, force };
+            land::land(&store, &project.repo, &which(name, current)?, &options)
         }
         Cmd::Rm { names, force } => {
             let (project, _) = here(&store)?;
@@ -274,16 +280,17 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
-/// A new base for a copy of a folder: when it was taken, as `SECONDS.NANOS`. The
-/// nanoseconds tell apart bases taken in the same second, since `undo` compares them.
-fn folder_base() -> String {
-    let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    format!("{}.{:09}", time.as_secs(), time.subsec_nanos())
+/// A new base for a copy of a folder, `N@SECONDS`: the project's next take of the
+/// folder, and when it was taken. `undo` tells bases apart by N alone, since two
+/// takes can share any clock reading.
+fn folder_base(project: &mut Project) -> String {
+    project.takes += 1;
+    format!("{}@{}", project.takes, now())
 }
 
 /// When a copy of a folder took its base, in seconds.
 fn copied_at(base: &str) -> Option<u64> {
-    base.split('.').next()?.parse().ok()
+    base.split_once('@')?.1.parse().ok()
 }
 
 /// The workspace that holds the default branch as last fetched, which copies fork.
@@ -371,6 +378,7 @@ fn get(store: &Store, repo: &str, dir: Option<PathBuf>, github: Option<String>) 
         workspace: name.clone(),
         branch: String::new(),
         folder: false,
+        takes: 0,
         copies: BTreeMap::new(),
     };
     // Kept before anything changes the home copy, as the start of every new copy.
@@ -403,6 +411,7 @@ fn get_folder(store: &Store, folder: &Path) -> Result<()> {
         workspace: name,
         branch: String::new(),
         folder: true,
+        takes: 0,
         copies: BTreeMap::new(),
     };
     store.create(&project)?;
@@ -421,9 +430,17 @@ fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
             bail!("{} already has a copy {name:?}; pick another name, or remove it with `gft rm {name}`", project.repo);
         }
     }
+    // A copy of a copy that landed sits on that landing, as it is now.
+    let mut stacked = None;
     let (source, mut base) = match from {
         Some(from) => {
             let from = copy(&project, from)?;
+            // A landing kept by Graft before 0.1 doesn't say its commit until that copy
+            // lands again, so nothing is built on it until then.
+            stacked = from.landed.clone().or_else(|| from.stacked.clone()).filter(|landed| !landed.commit.is_empty());
+            if let Some(stacked) = &mut stacked {
+                stacked.files.clear();
+            }
             (from.workspace.clone(), Some(from.base.clone()))
         }
         // Each copy is the folder as it is when made.
@@ -441,22 +458,27 @@ fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
         let dir = parent.join(format!("{home_name}+{name}"));
         let workspace = format!("{}.{name}", project.workspace);
         fork(&source, Some(&dir), &workspace)?;
-        let commit = match &base {
-            Some(commit) => commit.clone(),
-            None if project.folder => folder_base(),
-            None => git(&dir, &["rev-parse", "HEAD"])?,
-        };
-        base = base.or_else(|| (!project.folder).then(|| commit.clone()));
-        let copy = Copy {
-            dir: dir.canonicalize()?,
-            workspace,
-            base: commit,
-            from: from.map(str::to_owned),
-            pr: None,
-            snapshots: Vec::new(),
-            next: 1,
-        };
+        if base.is_none() && !project.folder {
+            base = Some(git(&dir, &["rev-parse", "HEAD"])?);
+        }
+        let dir = dir.canonicalize()?;
         store.edit(&project.repo, |project| {
+            let base = match &base {
+                Some(commit) => commit.clone(),
+                None => folder_base(project),
+            };
+            let copy = Copy {
+                dir: dir.clone(),
+                workspace,
+                base,
+                from: from.map(str::to_owned),
+                stacked: stacked.clone(),
+                landed: None,
+                pending: None,
+                pr: None,
+                snapshots: Vec::new(),
+                next: 1,
+            };
             project.copies.insert(name.clone(), copy);
             Ok(())
         })?;
@@ -523,15 +545,23 @@ fn files(n: usize) -> String {
     }
 }
 
-/// How many of the copy's changed files would be lost: all of them when it has no
-/// pull request, else those not as they were at the last landing.
+/// How many of the copy's files would be lost: every changed one when it never
+/// landed, else each not as the last landing left it. That counts a file the landing
+/// carried that the copy put back as it was before the landing, a change of its own;
+/// not one a newer base has some other way, as once its pull request is merged,
+/// upstream changes the file again, and the copy syncs.
 fn unlanded(copy: &Copy) -> Result<usize> {
     mount_copy(copy)?;
     let changed = changes(&copy.workspace, None, &copy.dir)?;
-    let Some(pr) = &copy.pr else { return Ok(changed.len()) };
+    let Some(landed) = &copy.landed else { return Ok(changed.len()) };
+    let changed: BTreeSet<&String> = changed.iter().map(|change| &change.path).collect();
     let mut lost = 0;
-    for change in &changed {
-        if pr.landed.get(&change.path) != Some(&land::fingerprint(&copy.dir, change)?) {
+    for path in changed.iter().copied().chain(landed.files.keys().filter(|path| !changed.contains(path))) {
+        let now = land::fingerprint(&copy.dir, path)?;
+        if landed.files.get(path) == Some(&now) {
+            continue;
+        }
+        if changed.contains(path) || now == land::fingerprint_at(&copy.dir, &landed.on, path)? {
             lost += 1;
         }
     }
@@ -657,14 +687,15 @@ fn sync(store: &Store, repo: &str, name: &str) -> Result<()> {
     mount_copy(&copy)?;
     // Moved in place, so programs working in the copy carry on.
     let updated = sandfs()?.update(&copy.workspace, None)?;
-    let new = match project.folder {
-        true => folder_base(),
-        false => git(&copy.dir, &["rev-parse", "HEAD"])?,
+    let commit = match project.folder {
+        true => None,
+        false => Some(git(&copy.dir, &["rev-parse", "HEAD"])?),
     };
-    store.edit(repo, |project| {
+    let new = store.edit(repo, |project| {
+        let base = commit.clone().unwrap_or_else(|| folder_base(project));
         let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
-        copy.base = new.clone();
-        Ok(())
+        copy.base = base.clone();
+        Ok(base)
     })?;
     let both = &updated.both;
     let mut conflicts = 0;
@@ -700,8 +731,9 @@ fn land_folder(store: &Store, project: &Project, name: &str) -> Result<()> {
     copy_changes(&copy.workspace, None, &project.home)?;
     sandfs()?.update(&copy.workspace, None)?;
     store.edit(&project.repo, |project| {
+        let base = folder_base(project);
         let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
-        copy.base = folder_base();
+        copy.base = base;
         Ok(())
     })?;
     println!("{name}: {} written to {}", files(changed.len()), project.home.display());
@@ -826,11 +858,22 @@ mod tests {
     }
 
     #[test]
-    fn folder_bases_taken_in_one_second_differ() {
-        let (a, b) = (folder_base(), folder_base());
+    fn folder_bases_differ_whatever_the_clock_says() {
+        let mut project = Project {
+            repo: "folder/notes".into(),
+            source: "/notes".into(),
+            home: "/notes".into(),
+            workspace: "notes".into(),
+            branch: String::new(),
+            folder: true,
+            takes: 0,
+            copies: BTreeMap::new(),
+        };
+        let (a, b) = (folder_base(&mut project), folder_base(&mut project));
         assert_ne!(a, b);
+        assert!(a.starts_with("1@") && b.starts_with("2@"), "{a} {b}");
         assert!(now() - copied_at(&a).unwrap() <= 1);
-        assert_eq!(copied_at("1700000000"), Some(1_700_000_000));
+        assert_eq!(copied_at("7@1700000000"), Some(1_700_000_000));
     }
 
     #[test]
