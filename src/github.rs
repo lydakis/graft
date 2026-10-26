@@ -32,7 +32,8 @@ impl GitHub {
         Ok(GitHub { api: api.trim_end_matches('/').to_owned(), repo: repo.to_owned(), token })
     }
 
-    /// Call `method` on `path` under the repository (`git/blobs`, `pulls`, ...).
+    /// Call `method` on `path` under the repository (`git/blobs`, `pulls`, ...), or on
+    /// the repository itself for an empty one.
     pub fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
         match self.try_call(method, path, body)? {
             (status, value) if status < 300 => Ok(value),
@@ -41,6 +42,12 @@ impl GitHub {
                 bail!("GitHub answered {method} {path} with {status}: {message}")
             }
         }
+    }
+
+    /// The repository's default branch.
+    pub fn default_branch(&self) -> Result<String> {
+        let repo = self.call("GET", "", None)?;
+        repo["default_branch"].as_str().map(str::to_owned).context("GitHub gave no default branch")
     }
 
     /// Like [`GitHub::call`], but none for a 404.
@@ -56,7 +63,10 @@ impl GitHub {
     }
 
     fn try_call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<(u16, Value)> {
-        let url = format!("{}/repos/{}/{}", self.api, self.repo, path);
+        let url = match path {
+            "" => format!("{}/repos/{}", self.api, self.repo),
+            path => format!("{}/repos/{}/{}", self.api, self.repo, path),
+        };
         let body_file = match body {
             Some(body) => {
                 let file = tempfile_with(&serde_json::to_vec(body)?)?;

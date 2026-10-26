@@ -86,7 +86,7 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
             let body: Value = if body.is_empty() { Value::Null } else { serde_json::from_slice(&body).unwrap() };
-            let path = path.split_once("/repos/o/n/").unwrap().1.to_owned();
+            let path = path.split_once("/repos/o/n").unwrap().1.trim_start_matches('/').to_owned();
             let mut made = state.lock().unwrap();
             let (status, answer) = match (method.as_str(), path.as_str()) {
                 ("GET", p) if p.starts_with("git/commits/") => {
@@ -98,6 +98,7 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
                         .map_or(format!("tree-of-{id}"), |n| made.commits[n]["tree"].as_str().unwrap().to_owned());
                     (200, json!({"sha": id, "tree": {"sha": tree}}))
                 }
+                ("GET", "") => (200, json!({"default_branch": "main"})),
                 ("POST", "git/blobs") => {
                     use base64::Engine;
                     let data =
@@ -546,6 +547,18 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
         std::fs::write(at(name).join("notes.txt"), format!("{name}\n")).unwrap();
     }
 
+    // A dry run says what landing would do, and does none of it.
+    let plan = gft.run(&at("fix"), &["land", "--dry-run"]);
+    assert_eq!(
+        plan,
+        format!(
+            "branch        graft/fix (made new)\ncommit        on {}\npull request  new or open one, against main\n\
+             files         1 file\nA notes.txt\n",
+            &first[..10]
+        )
+    );
+    assert!(made.lock().unwrap().commits.is_empty() && made.lock().unwrap().refs.is_empty());
+
     // The branch moves but GitHub's answer is lost: landing again sees its own commit
     // there and goes on to the pull request, without a second commit.
     made.lock().unwrap().lose_ref = true;
@@ -616,18 +629,34 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
         made.refs.insert("heads/graft/fix".into(), "pushed".into());
     }
     std::fs::write(at("fix").join("notes.txt"), "fix, and more\n").unwrap();
+    let plan = gft.run(&at("fix"), &["land", "--force", "--dry-run"]);
+    assert!(plan.contains("(moved from pushed, replacing commits fix didn't land)"), "{plan}");
     assert_eq!(made.lock().unwrap().refs["heads/graft/fix"], "pushed");
     gft.run(&at("fix"), &["land", "--force"]);
     let forced = made.lock().unwrap().refs["heads/graft/fix"].clone();
     assert_eq!(made.lock().unwrap().commits.last().unwrap()["parents"], json!(["pushed"]));
 
-    // A copy of fix sits on fix's landing as it was: fix landing more since changes
-    // neither what it holds nor what its own landing follows.
-    gft.run(&home, &["new", "child", "--from", "fix"]);
+    // Only a copy that landed can be built on.
+    gft.run(&home, &["new", "unlanded"]);
+    let said = String::from_utf8_lossy(&gft.try_run(&home, &["new", "nope", "--on", "unlanded"]).stderr).into_owned();
+    assert!(said.contains("unlanded hasn't landed, so there is no branch to build on"), "{said}");
+    gft.run(&home, &["rm", "unlanded"]);
+
+    // A copy built on fix sits on fix's landing as it was: fix landing more since
+    // changes neither what it holds nor what its own landing follows.
+    gft.run(&home, &["new", "child", "--on", "fix"]);
+    // Another attempt from fix's files is no stack: it goes to main with all of them.
+    gft.run(&home, &["new", "alt", "--from", "fix"]);
+    let plan = gft.run(&at("alt"), &["land", "-n"]);
+    assert!(plan.contains("against main\n") && plan.contains(&format!("on {}\n", &first[..10])), "{plan}");
+    gft.run(&home, &["rm", "--force", "alt"]);
     std::fs::write(at("fix").join("notes.txt"), "fix, more, and later\n").unwrap();
     gft.run(&at("fix"), &["land"]);
     assert_ne!(made.lock().unwrap().refs["heads/graft/fix"], forced);
     std::fs::write(at("child").join("child.txt"), "on top\n").unwrap();
+    let plan = gft.run(&at("child"), &["land", "-n"]);
+    assert!(plan.contains(&format!("commit        on {}\n", &forced[..10.min(forced.len())])), "{plan}");
+    assert!(plan.contains("against graft/fix\n"), "{plan}");
     gft.run(&at("child"), &["land"]);
     {
         let made = made.lock().unwrap();
@@ -668,4 +697,52 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
     gft.run(&at("merged"), &["sync"]);
     assert_eq!(gft.run(&at("merged"), &["changes"]), "");
     gft.run(&home, &["rm", "merged"]);
+}
+
+#[test]
+fn copies_of_a_checkout_start_from_its_work() {
+    if !mounts() {
+        return;
+    }
+    let upstream = tempfile::Builder::new().prefix("graft-upstream").tempdir().unwrap();
+    let repo = upstream.path();
+    git(repo, &["init", "-q"]);
+    std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-q", "-m", "first"]);
+    let (api, made) = fake_github();
+    let gft = Gft { sandfs_home: tempfile::tempdir().unwrap(), graft_home: tempfile::tempdir().unwrap(), api };
+    let work = tempfile::tempdir().unwrap();
+    let work = work.path().canonicalize().unwrap();
+    git(&work, &["clone", "-q", &format!("file://{}", repo.display()), "app"]);
+    let app = work.join("app");
+    std::fs::write(app.join("README.md"), "hello, edited\n").unwrap();
+    std::fs::write(app.join("new.txt"), "new\n").unwrap();
+    let head = git(&app, &["rev-parse", "HEAD"]);
+
+    // On a branch of its own, with no word from origin on its default branch:
+    // GitHub says which it is.
+    git(&app, &["remote", "set-head", "origin", "--delete"]);
+    git(&app, &["checkout", "-q", "-b", "feature"]);
+    // Its origin isn't on GitHub, so it needs saying where copies land.
+    let refused = gft.try_run(&work, &["get", "./app"]);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("isn't on GitHub"));
+    gft.run(&work, &["get", "./app", "--github", "o/n"]);
+    assert!(gft.run(&app, &["ls"]).contains("(checkout, main)"));
+
+    // A copy has the checkout's uncommitted work; the checkout keeps it too.
+    gft.run(&app, &["new", "try"]);
+    let copy = work.join("app+try");
+    assert_eq!(std::fs::read_to_string(copy.join("README.md")).unwrap(), "hello, edited\n");
+    assert_eq!(gft.run(&copy, &["changes"]), "M README.md\nA new.txt\n");
+    assert_eq!(std::fs::read_to_string(app.join("README.md")).unwrap(), "hello, edited\n");
+    std::fs::write(copy.join("more.txt"), "more\n").unwrap();
+    gft.run(&copy, &["land"]);
+    assert_eq!(made.lock().unwrap().commits[0]["parents"], json!([head]));
+
+    // Committed in the checkout, the edit is the base's once the copy syncs.
+    git(&app, &["commit", "-q", "-am", "edit"]);
+    gft.run(&copy, &["sync"]);
+    assert_eq!(gft.run(&copy, &["changes"]), "A more.txt\nA new.txt\n");
+    gft.run(&app, &["rm", "--force", "try"]);
 }

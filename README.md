@@ -1,6 +1,6 @@
 # Graft
 
-Work in instant copies of a GitHub repository, or of a plain folder. Each copy is a [sandfs](https://github.com/lydakis/sandfs) folder over a commit of the default branch, so nothing is cloned, a copy appears in a fraction of a second, and it costs only what it changes. When a copy is good, `gft land` turns it into a branch and a pull request through GitHub's API, with no local commit and no push.
+Work in many copies of a GitHub repository, or of a plain folder, each made in a fraction of a second. Each copy is a [sandfs](https://github.com/lydakis/sandfs) folder over a commit of the default branch: the copies share one set of the repository's files, downloaded from GitHub as they are first read, and each copy keeps only what it changes. Nothing is cloned up front, so the first read of a file, and the first search or build across the whole tree, waits for those files to arrive; after that they are on disk and shared by every copy. How that compares with git worktrees, measured: [docs/compared-with-worktrees.md](docs/compared-with-worktrees.md). When a copy is good, `gft land` turns it into a branch and a pull request through GitHub's API, with no local commit and no push.
 
 The command is `gft` (also installed as `graft`). For plain folders, see [Plain folders](#plain-folders).
 
@@ -28,7 +28,7 @@ Many agents at once:
 gft new agent-{01..20}              # twenty copies
 gft ls                              # files changed per copy, and which copies changed the same files (outside a copy: every project)
 gft changes agent-07 agent-03       # how two attempts differ
-gft new agent-07b --from agent-07   # branch an attempt mid-task, keeping its changes
+gft new agent-07b --from agent-07   # another attempt from agent-07's files so far
 gft land agent-07 --draft
 gft rm agent-{01..20} agent-07b       # refuses copies with changes that never landed
 gft rm --force agent-07b            # delete one anyway, losing those changes
@@ -38,8 +38,8 @@ gft rm --force agent-07b            # delete one anyway, losing those changes
 
 | Command | What it does |
 | --- | --- |
-| `gft get OWNER/NAME [DIR] [--github OWNER/NAME]` | Mount the default branch at DIR (default `./NAME`) as the home copy. Takes a repository URL too; for one that isn't github.com's, `--github` says where copies land. Given a folder (`./notes`, `/data/survey`), the folder itself is the home copy (see [Plain folders](#plain-folders)). |
-| `gft new NAME... [--from COPY]` | Copies on the newest commit (fetched once for all of them), or on another copy with its changes. They appear next to the home copy as `HOME+NAME`. |
+| `gft get OWNER/NAME [DIR] [--github OWNER/NAME]` | Mount the default branch at DIR (default `./NAME`) as the home copy. Takes a repository URL too; for one that isn't github.com's, `--github` says where copies land. Given a git checkout on this machine (`gft get .`), the checkout is the home copy: copies start from its commit and its uncommitted changes, `sync` follows its branch, and copies land on its origin on GitHub (or `--github`); the commit must be pushed before a copy of it lands. Given a plain folder (`./notes`, `/data/survey`), the folder itself is the home copy (see [Plain folders](#plain-folders)). |
+| `gft new NAME... [--from COPY \| --on COPY]` | Copies on the newest commit (fetched once for all of them), or on another copy with its changes so far. `--from` makes another attempt at the same work: its pull request goes against the default branch with all the changes. `--on` builds on top of a copy that landed: its pull request goes against that copy's branch and shows only its own changes. They appear next to the home copy as `HOME+NAME`. |
 | `gft ls` | Copies, files changed, the commit each sits on, pull requests, overlaps. Outside a copy, every project's. |
 | `gft status` | In a copy: its name, folder, commit, files changed, snapshots and pull request. In the home copy: the project and how many copies exist. |
 | `gft path NAME` | A copy's folder. |
@@ -47,14 +47,14 @@ gft rm --force agent-07b            # delete one anyway, losing those changes
 | `gft save [NOTE]` / `gft undo [N]` | Snapshot the copy; go back N snapshots (default 1). Both take `-c COPY`. |
 | `gft undo --list` | The copy's snapshots, newest first, each with its number for `undo N`, how long ago it was taken and its note. Changes nothing. |
 | `gft sync [NAME]` | Move the copy onto the newest commit, in place: programs working in the copy carry on. Files changed on both sides are merged line by line with `git merge-file`; conflicts are left marked in the file and listed. |
-| `gft land [NAME] [-m TITLE] [--body TEXT \| --body-file PATH] [--draft] [--force]` | Commit the copy's changes on branch `graft/NAME` on GitHub and open a pull request (against the copy it came from, if that one had landed when this copy was made). Landing again adds a commit, also when the copy was put back as its base has it, which empties the pull request. The description is TEXT or the contents of PATH (`-` reads standard input), followed by a line saying it was landed with `gft land`. Giving one when landing again replaces the description on the open pull request; giving none leaves it as it is. A landing cut short (a lost connection, GitHub refusing the pull request) is finished by landing again, without a second commit or pull request. If the branch on GitHub has commits the copy didn't land, `land` stops rather than undo them; `--force` lands anyway. |
+| `gft land [NAME] [-m TITLE] [--body TEXT \| --body-file PATH] [--draft] [--force] [--dry-run]` | Commit the copy's changes on branch `graft/NAME` on GitHub and open a pull request (against the branch of the copy it was built on, with `new --on`). Landing again adds a commit, also when the copy was put back as its base has it, which empties the pull request. The description is TEXT or the contents of PATH (`-` reads standard input), followed by a line saying it was landed with `gft land`. Giving one when landing again replaces the description on the open pull request; giving none leaves it as it is. A landing cut short (a lost connection, GitHub refusing the pull request) is finished by landing again, without a second commit or pull request. If the branch on GitHub has commits the copy didn't land, `land` stops rather than undo them; `--force` lands anyway. `--dry-run` (`-n`) prints what landing would do (the branch, the commit's parents, the pull request and the files) and changes nothing. |
 | `gft rm [--force] NAME...` | Delete copies and their snapshots. Pull requests stay. A copy with changes that never landed (it never landed, or files changed since its last landing, put back as the base has them included) is kept, and the files that would be lost are counted, unless `--force` is given. |
 
 Commands that take a copy use the one the current folder is in when none is named.
 
 ## Many agents at once
 
-Give each agent its own copy, named for its task, and let each land its own pull request. Nothing is shared between copies, so one agent's half-finished edit never breaks another's build, and the copies cost almost nothing to make.
+Give each agent its own copy, named for its task, and let each land its own pull request. No change is shared between copies, so one agent's half-finished edit never breaks another's build, and a new copy takes no disk until it changes something.
 
 ```bash
 gft new fix-timeout add-retries docs-env   # one copy per agent, made together
@@ -68,16 +68,17 @@ gft ls
 gft changes fix-timeout add-retries        # how the two copies differ
 
 # a follow-up that needs fix-timeout's change underneath it:
-gft new retry-docs --from fix-timeout
+gft land fix-timeout --draft
+gft new retry-docs --on fix-timeout
 
 gft sync add-retries                       # main moved on
 gft land add-retries -m "Retry on timeout"             # one pull request per copy
 ```
 
 - **Check overlaps with `gft ls`.** Each copy's line ends with `overlaps OTHER on FILE` for every other copy that changed a file it also changed. It only sees changes made so far, so an agent runs it before it starts on a shared file and once more before it lands. `gft ls` lists every copy of the repository, so an agent reads its own line. An overlap isn't an error: either the agents split the work differently, or the later one expects to resolve a merge. `gft changes OTHER` lists the files the other copy changed, and `gft changes MINE OTHER` how the two differ.
-- **Stack dependent work with `gft new NAME --from COPY`.** The new copy starts with that copy's changes, so the second agent builds on the first one's work without waiting for it to land. Independent work always starts from main (plain `gft new`), so it never inherits another agent's unfinished work.
+- **Stack dependent work with `gft new NAME --on COPY`.** The new copy starts with that copy's changes, so the second agent builds on the first one's work without waiting for it to merge. The first copy must have landed (a draft will do); the stacked one's pull request goes against its branch. To try the same work another way instead, `--from COPY` starts from its files with a pull request of its own against main. Independent work always starts from main (plain `gft new`), so it never inherits another agent's unfinished work.
 - **Sync when main has moved and you are about to land, or when you need what landed.** Other agents' pull requests move main; a copy stays on the commit it started from until it syncs. Syncing is not needed to keep working, and an agent can sync from inside its copy while its programs keep running there. Files changed on both sides are merged line by line; any listed as conflicts have `<<<<<<<` markers to fix before you build, test and land.
-- **Land each copy when it is good.** `gft land -m TITLE` opens `graft/NAME` as a pull request; `--draft` leaves it for review. A copy made from one that had landed opens its pull request against that one's branch and shows only its own changes, even if the parent lands more later; made from one that hadn't, it carries the parent's changes in its own pull request against main. So land the parent first, then make the stacked copy, and review in that order. Landing again after review comments adds a commit to the same pull request. When the pull requests are merged, `gft rm` the copies.
+- **Land each copy when it is good.** `gft land -m TITLE` opens `graft/NAME` as a pull request; `--draft` leaves it for review. A copy made `--on` another opens its pull request against that one's branch and shows only its own changes, even if the other lands more later; review them in that order. Landing again after review comments adds a commit to the same pull request. When the pull requests are merged, `gft rm` the copies.
 
 ## Plain folders
 
@@ -124,7 +125,19 @@ sandfs is built into `gft`, so it needn't be installed.
 
 - `undo` back past a `sync` makes the copy again, unmounting it for a moment, so no program may be working inside it then (an agent's shell sitting in the folder counts). So does `rm`. Other undos, and `sync`, change the copy in place and need nothing stopped.
 - Landing uploads each changed file as one API call. A few hundred changed files take a while, and GitHub allows 5,000 calls an hour per token.
-- Repositories on GitHub (or a stand-in for its API), and plain folders. A folder that is a git repository is taken as a repository: `gft get OWNER/NAME`.
+- Repositories on GitHub (or a stand-in for its API), checkouts of them, and plain folders.
+
+## Git in a copy, and what `land` sends
+
+A copy is a git checkout as far as git can tell: `git status`, `diff`, `log`, `blame` and local commits work in it, and editors and build tools see an ordinary folder. `land` doesn't use git's commits, though. It reads the copy's files and sends them to GitHub as they are on disk, which draws a line around what git would otherwise do for you:
+
+- **Files go as their bytes.** A changed file is sent as it is on disk, without the repository's clean filters or line-ending conversion (`.gitattributes` `filter`, `text`, `eol`), as `git hash-object --no-filters` would see it. Files come into a copy the same way, as stored in the repository.
+- **Git LFS** files are their pointer files in a copy. A pointer left alone lands unchanged; a real file written in its place lands as a plain git file, not through LFS.
+- **No hooks run.** No local commit is made, so `pre-commit`, `commit-msg` and the like never run; run your checks before landing.
+- **Commits aren't signed.** The commits `land` makes through the API carry no signature, so a branch rule that requires signed commits refuses them.
+- **Local commits are ignored.** `land` sends what the files are now, in one commit per landing, with the message from `-m`; commits made with git inside the copy, and their messages, don't reach GitHub.
+- **Submodules** don't appear in a copy, and a copy's landing leaves them as they are.
+- Modes: files, executable files and symbolic links land as such.
 
 ## Configuration
 

@@ -1,4 +1,4 @@
-//! Graft (`gft`): work in instant copies of a GitHub repository, or of a plain folder.
+//! Graft (`gft`): work in many fast copies of a GitHub repository, or of a plain folder.
 //!
 //! Every copy is a sandfs folder over a commit of the repository's default branch, so
 //! nothing is cloned and a copy costs what it changes. GitHub stays the place where
@@ -22,11 +22,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
-use crate::state::{Copy, Project, Snapshot, Store, check_copy_name};
+use crate::state::{Copy, Landing, Project, Snapshot, Store, check_copy_name};
 use crate::tools::{changes, copy_changes, ensure_mounted, fork, git, mount, mounted, path_str, sandfs, short};
 
 #[derive(Parser)]
-#[command(name = "gft", version, about = "Work in instant copies of a GitHub repository, built on sandfs")]
+#[command(
+    name = "gft",
+    version,
+    about = "Work in fast copies of a GitHub repository that share its files, built on sandfs"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -53,9 +57,14 @@ enum Cmd {
     New {
         #[arg(required = true)]
         names: Vec<String>,
-        /// Start from this copy instead, with its changes.
-        #[arg(long, value_name = "COPY")]
+        /// Start from this copy's files, as another attempt at the same work: its pull
+        /// request goes against the default branch and carries all of them.
+        #[arg(long, value_name = "COPY", conflicts_with = "on")]
         from: Option<String>,
+        /// Build on top of this copy's landing, as work that depends on it: its pull
+        /// request goes against that copy's branch and shows only its own changes.
+        #[arg(long, value_name = "COPY")]
+        on: Option<String>,
     },
     /// List the copies: how many files each changed, the commit it sits on, its pull
     /// request, and which other copies changed the same files.
@@ -118,6 +127,10 @@ enum Cmd {
         /// whose changes this landing then undoes.
         #[arg(long)]
         force: bool,
+        /// Print what landing would do (the branch, the commit's parents, the pull
+        /// request and the files), changing nothing on GitHub or here.
+        #[arg(long, short = 'n')]
+        dry_run: bool,
     },
     /// Delete copies, with their snapshots. Their pull requests stay as they are.
     /// A copy with changes that never landed (no pull request, or files changed since
@@ -156,7 +169,10 @@ fn run(cli: Cli) -> Result<()> {
     let store = Store::locate()?;
     match cli.command {
         Cmd::Get { repo, dir, github } => get(&store, &repo, dir, github),
-        Cmd::New { names, from } => new(&store, &names, from.as_deref()),
+        Cmd::New { names, from, on } => match on {
+            Some(on) => new(&store, &names, Some((&on, true))),
+            None => new(&store, &names, from.as_deref().map(|from| (from, false))),
+        },
         Cmd::Ls => ls(&store),
         Cmd::Status => status(&store),
         Cmd::Path { name } => {
@@ -173,6 +189,7 @@ fn run(cli: Cli) -> Result<()> {
                         Ok((copy.workspace.clone(), copy.dir.clone()))
                     }
                     None if project.folder => bail!("name a copy: the folder itself is what copies change"),
+                    None if project.checkout => bail!("name a copy; in the checkout itself, `git status` says"),
                     None => Ok((project.workspace.clone(), project.home.clone())),
                 }
             };
@@ -209,13 +226,13 @@ fn run(cli: Cli) -> Result<()> {
             let (project, current) = here(&store)?;
             sync(&store, &project.repo, &which(name, current)?)
         }
-        Cmd::Land { name, message, body, body_file, draft, force } => {
+        Cmd::Land { name, message, body, body_file, draft, force, dry_run } => {
             let (project, current) = here(&store)?;
             if project.folder {
-                if message.is_some() || body.is_some() || body_file.is_some() || draft || force {
+                if message.is_some() || body.is_some() || body_file.is_some() || draft || force || dry_run {
                     bail!(
-                        "a copy of a folder lands into the folder; --message, --body, --draft and --force are for \
-                         pull requests"
+                        "a copy of a folder lands into the folder; --message, --body, --draft, --force and \
+                         --dry-run are for pull requests"
                     );
                 }
                 return land_folder(&store, &project, &which(name, current)?);
@@ -224,7 +241,7 @@ fn run(cli: Cli) -> Result<()> {
                 Some(path) => Some(read_body(&path)?),
                 None => body,
             };
-            let options = land::Options { message: message.as_deref(), body: body.as_deref(), draft, force };
+            let options = land::Options { message: message.as_deref(), body: body.as_deref(), draft, force, dry_run };
             land::land(&store, &project.repo, &which(name, current)?, &options)
         }
         Cmd::Rm { names, force } => {
@@ -355,8 +372,14 @@ fn as_folder(repo: &str) -> Option<PathBuf> {
 
 fn get(store: &Store, repo: &str, dir: Option<PathBuf>, github: Option<String>) -> Result<()> {
     if let Some(folder) = as_folder(repo) {
-        if dir.is_some() || github.is_some() {
-            bail!("a folder is its own home copy; DIR and --github are for repositories");
+        if dir.is_some() {
+            bail!("a folder is its own home copy; DIR is for repositories on GitHub");
+        }
+        if folder.join(".git").exists() {
+            return get_checkout(store, &folder, github);
+        }
+        if github.is_some() {
+            bail!("a plain folder lands into itself; --github is for repositories");
         }
         return get_folder(store, &folder);
     }
@@ -378,6 +401,7 @@ fn get(store: &Store, repo: &str, dir: Option<PathBuf>, github: Option<String>) 
         workspace: name.clone(),
         branch: String::new(),
         folder: false,
+        checkout: false,
         takes: 0,
         copies: BTreeMap::new(),
     };
@@ -387,6 +411,57 @@ fn get(store: &Store, repo: &str, dir: Option<PathBuf>, github: Option<String>) 
     let commit = git(&dir, &["rev-parse", "HEAD"])?;
     store.create(&project)?;
     println!("{}: {slug} at {} ({})", dir.display(), short(&commit), project.branch);
+    Ok(())
+}
+
+/// Make the git checkout `folder` a project, whose home copy is the checkout itself:
+/// copies start from its commit and its uncommitted changes, and land on GitHub.
+fn get_checkout(store: &Store, folder: &Path, github: Option<String>) -> Result<()> {
+    let folder = folder.canonicalize()?;
+    let slug = match (github, git(&folder, &["remote", "get-url", "origin"]).ok()) {
+        (Some(github), _) => owner_name(&github).context("--github takes OWNER/NAME")?,
+        (None, Some(url)) => parse_repo(&url, None).map(|(slug, _)| slug).with_context(|| {
+            format!(
+                "{}'s origin, {url}, isn't on GitHub; say where copies land with --github OWNER/NAME",
+                folder.display()
+            )
+        })?,
+        (None, None) => {
+            bail!("{} has no remote named origin; say where copies land with --github OWNER/NAME", folder.display())
+        }
+    };
+    let name = folder.file_name().context("the folder has no name")?.to_string_lossy().into_owned();
+    check_copy_name(&name).with_context(|| format!("{} can't name a project", folder.display()))?;
+    if let Some(other) = store.projects()?.into_iter().find(|project| project.workspace == name) {
+        bail!("{} is already a project named {name}; Graft names a project after its folder", other.home.display());
+    }
+    // Pull requests go against the default branch: as the checkout last heard of it
+    // from origin, else as GitHub says.
+    let known = git(&folder, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .ok()
+        .and_then(|branch| branch.strip_prefix("origin/").map(str::to_owned));
+    let branch = match known {
+        Some(branch) => branch,
+        None => github::GitHub::new(&slug)
+            .and_then(|github| github.default_branch())
+            .with_context(|| format!("asking GitHub for {slug}'s default branch, which pull requests go against"))?,
+    };
+    let project = Project {
+        repo: slug.clone(),
+        source: path_str(&folder)?.to_owned(),
+        home: folder.clone(),
+        workspace: name,
+        branch,
+        folder: false,
+        checkout: true,
+        takes: 0,
+        copies: BTreeMap::new(),
+    };
+    store.create(&project)?;
+    println!(
+        "{}: {slug} from this checkout; `gft new NAME` copies its commit and uncommitted changes next to it",
+        folder.display()
+    );
     Ok(())
 }
 
@@ -411,6 +486,7 @@ fn get_folder(store: &Store, folder: &Path) -> Result<()> {
         workspace: name,
         branch: String::new(),
         folder: true,
+        checkout: false,
         takes: 0,
         copies: BTreeMap::new(),
     };
@@ -419,7 +495,9 @@ fn get_folder(store: &Store, folder: &Path) -> Result<()> {
     Ok(())
 }
 
-fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
+/// Make copies of the default branch, or of the copy `from`: built on top of its
+/// landing when `on` is set, else as another attempt.
+fn new(store: &Store, names: &[String], from: Option<(&str, bool)>) -> Result<()> {
     let (project, _) = here(store)?;
     for (i, name) in names.iter().enumerate() {
         check_copy_name(name)?;
@@ -430,21 +508,32 @@ fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
             bail!("{} already has a copy {name:?}; pick another name, or remove it with `gft rm {name}`", project.repo);
         }
     }
-    // A copy of a copy that landed sits on that landing, as it is now.
+    // A copy built on top of another sits on that one's landing, as it is now.
     let mut stacked = None;
     let (source, mut base) = match from {
-        Some(from) => {
-            let from = copy(&project, from)?;
-            // A landing kept by Graft before 0.1 doesn't say its commit until that copy
-            // lands again, so nothing is built on it until then.
-            stacked = from.landed.clone().or_else(|| from.stacked.clone()).filter(|landed| !landed.commit.is_empty());
-            if let Some(stacked) = &mut stacked {
-                stacked.files.clear();
+        Some((name, on)) => {
+            let from = copy(&project, name)?;
+            if on {
+                if project.folder {
+                    bail!("a copy of a folder lands into the folder, so there is nothing to build on; use --from");
+                }
+                let Some(landed) = &from.landed else {
+                    bail!(
+                        "{name} hasn't landed, so there is no branch to build on: land it first (a draft will do), \
+                         or start from its files with --from"
+                    );
+                };
+                // A landing kept by Graft before 0.1 doesn't say its commit until that
+                // copy lands again.
+                if landed.commit.is_empty() {
+                    bail!("land {name} once more first: Graft before 0.1 didn't keep which commit it landed");
+                }
+                stacked = Some(Landing { files: BTreeMap::new(), ..landed.clone() });
             }
             (from.workspace.clone(), Some(from.base.clone()))
         }
-        // Each copy is the folder as it is when made.
-        None if project.folder => (project.source.clone(), None),
+        // Each copy is the folder, or the checkout, as it is when made.
+        None if project.folder || project.checkout => (project.source.clone(), None),
         None => {
             // Brings the default branch up to date once for all the copies made now.
             let main = main_workspace(&project);
@@ -471,7 +560,7 @@ fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
                 dir: dir.clone(),
                 workspace,
                 base,
-                from: from.map(str::to_owned),
+                from: from.map(|(from, _)| from.to_owned()),
                 stacked: stacked.clone(),
                 landed: None,
                 pending: None,
@@ -503,7 +592,11 @@ fn ls(store: &Store) -> Result<()> {
 }
 
 fn list(project: &Project) -> Result<()> {
-    let kind = if project.folder { "folder".to_owned() } else { format!("home, {}", project.branch) };
+    let kind = match (project.folder, project.checkout) {
+        (true, _) => "folder".to_owned(),
+        (_, true) => format!("checkout, {}", project.branch),
+        _ => format!("home, {}", project.branch),
+    };
     println!("{}\t{}\t({kind})", project.workspace, project.home.display());
     let mut changed: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for (name, copy) in &project.copies {
@@ -866,6 +959,7 @@ mod tests {
             workspace: "notes".into(),
             branch: String::new(),
             folder: true,
+            checkout: false,
             takes: 0,
             copies: BTreeMap::new(),
         };
