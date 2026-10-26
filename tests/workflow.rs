@@ -1075,6 +1075,19 @@ fn copies_built_on_merged_work_move_onto_main_with_it() {
     // Nor is the copy built on it moved onto main, which has none of their work yet.
     let synced = gft.run(&work.join("app+leaf"), &["sync"]);
     assert!(!synced.contains("builds on main"), "{synced}");
+    // Once the branch it was merged into reaches main, it moves onto main.
+    std::fs::write(repo.join("three.txt"), "x\n").unwrap();
+    let merged = commit_upstream(repo, "mid.txt", "y\n");
+    {
+        let mut made = made.lock().unwrap();
+        let head = made.refs["heads/graft/base3"].clone();
+        made.pulls[6]["merge_commit_sha"] = json!(head);
+        made.pulls[5]["state"] = json!("closed");
+        made.pulls[5]["merged_at"] = json!("2026-10-26T00:00:00Z");
+        made.pulls[5]["merge_commit_sha"] = json!(merged);
+    }
+    let synced = gft.run(&work.join("app+leaf"), &["sync"]);
+    assert!(synced.contains("graft/mid was merged (#7); leaf now builds on main"), "{synced}");
 }
 
 #[test]

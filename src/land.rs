@@ -405,20 +405,33 @@ fn head_of(github: &GitHub, branch: &str) -> Result<Option<String>> {
 /// The number of the pull request that carried `landing` into the branch `into` (the
 /// default branch), if one did: one from its branch whose last commit has the
 /// landing's. A branch name used again after an earlier pull request from it was
-/// merged doesn't count, nor does one merged into another copy's branch, whose work
-/// reaches `into` only once that one does.
+/// merged doesn't count. One merged into another copy's branch counts once that
+/// branch's own pull request, with the merge, reaches `into`, however many branches
+/// the work went through on the way.
 pub fn merged_pull(github: &GitHub, repo: &str, landing: &Landing, into: &str) -> Result<Option<u64>> {
     let owner = repo.split('/').next().expect("owner/name");
-    let found = github.call("GET", &format!("pulls?head={owner}:{}&state=closed", landing.branch), None)?;
-    for pull in found.as_array().map(Vec::as_slice).unwrap_or_default() {
-        let head = pull["head"]["sha"].as_str().unwrap_or_default();
-        if pull["merged_at"].is_string()
-            && pull["base"]["ref"] == into
-            && !head.is_empty()
-            && contains(github, head, &landing.commit)?
-        {
-            return Ok(pull["number"].as_u64());
+    let (mut branch, mut commit) = (landing.branch.clone(), landing.commit.clone());
+    let mut first = None;
+    // A stack is a few copies deep; the bound only stops a cycle of branches.
+    for _ in 0..16 {
+        let found = github.call("GET", &format!("pulls?head={owner}:{branch}&state=closed"), None)?;
+        let mut next = None;
+        for pull in found.as_array().map(Vec::as_slice).unwrap_or_default() {
+            let head = pull["head"]["sha"].as_str().unwrap_or_default();
+            if pull["merged_at"].is_string() && !head.is_empty() && contains(github, head, &commit)? {
+                next = Some(pull.clone());
+                break;
+            }
         }
+        let Some(pull) = next else { return Ok(None) };
+        let number = first.get_or_insert(pull["number"].as_u64());
+        let base = pull["base"]["ref"].as_str().unwrap_or_default();
+        if base == into {
+            return Ok(*number);
+        }
+        // Merged into another branch: its work reaches `into` with that branch's.
+        let Some(merge) = pull["merge_commit_sha"].as_str() else { return Ok(None) };
+        (branch, commit) = (base.to_owned(), merge.to_owned());
     }
     Ok(None)
 }
