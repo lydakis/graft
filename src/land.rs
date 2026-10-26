@@ -177,7 +177,8 @@ fn mode(path: &Path) -> Result<(&'static str, Option<Vec<u8>>)> {
 }
 
 /// What a changed file looked like, so `gft rm` can tell whether it is still what
-/// landed. It is the file's own mode and git hash, not its modification time or the
+/// landed. It is the file's own mode and the git hash of its bytes as landing sends
+/// them, without the repository's filters, not its modification time or the
 /// copy's base: `gft sync` rewrites times and moves the base without touching what
 /// the copy changed, and judging by either would call a landed copy unlanded (or,
 /// the other way, miss an edit made inside the same second as the landing). A file
@@ -191,7 +192,7 @@ pub fn fingerprint(dir: &Path, change: &Change) -> Result<String> {
     let (mode, link) = mode(&path)?;
     let hash = match link {
         Some(target) => String::from_utf8_lossy(&target).into_owned(),
-        None => git(dir, &["hash-object", "--", &change.path])?,
+        None => git(dir, &["hash-object", "--no-filters", "--", &change.path])?,
     };
     Ok(format!("{mode} {hash}"))
 }
