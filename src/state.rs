@@ -164,16 +164,24 @@ impl Store {
     /// The project whose home copy or one of whose copies holds `dir`, and that copy.
     pub fn find(&self, dir: &Path) -> Result<(Project, Option<String>)> {
         let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        // The deepest folder that holds `dir` wins, since a folder project may sit
+        // inside another one.
+        let mut found: Option<(usize, Project, Option<String>)> = None;
         for project in self.projects()? {
-            for (name, copy) in &project.copies {
-                if dir.starts_with(&copy.dir) {
-                    let name = name.clone();
-                    return Ok((project, Some(name)));
-                }
+            let homes = project.copies.iter().map(|(name, copy)| (&copy.dir, Some(name.clone())));
+            let best = homes
+                .chain([(&project.home, None)])
+                .filter(|(home, _)| dir.starts_with(home))
+                .map(|(home, name)| (home.components().count(), name))
+                .max_by_key(|(depth, _)| *depth);
+            if let Some((depth, name)) = best
+                && found.as_ref().is_none_or(|(deepest, ..)| depth > *deepest)
+            {
+                found = Some((depth, project, name));
             }
-            if dir.starts_with(&project.home) {
-                return Ok((project, None));
-            }
+        }
+        if let Some((_, project, name)) = found {
+            return Ok((project, name));
         }
         bail!("{} is in no Graft copy; start with `gft get OWNER/REPO`", dir.display())
     }

@@ -476,4 +476,14 @@ fn copies_of_a_plain_folder_land_back_into_it() {
     assert_eq!(std::fs::read_to_string(folder.join("new.md")).unwrap(), "new\n");
     gft.run(&folder, &["rm", "other"]);
     assert!(!gft.run(&folder, &["ls"]).contains("other"));
+
+    // A folder inside another one can be a project of its own; inside it, it wins
+    // (named to come after the outer one, which is looked at first).
+    let inner = folder.join("zone");
+    std::fs::create_dir(&inner).unwrap();
+    std::fs::write(inner.join("only.md"), "inner\n").unwrap();
+    gft.run(&folder, &["get", "./zone"]);
+    gft.run(&inner, &["new", "sub"]);
+    assert_eq!(std::fs::read_to_string(folder.join("zone+sub/only.md")).unwrap(), "inner\n");
+    gft.run(&inner, &["rm", "sub"]);
 }
