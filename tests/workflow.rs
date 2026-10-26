@@ -1057,6 +1057,10 @@ fn copies_built_on_merged_work_move_onto_main_with_it() {
     gft.run(&home, &["new", "mid", "--on", "base3"]);
     std::fs::write(work.join("app+mid/mid.txt"), "y\n").unwrap();
     gft.run(&work.join("app+mid"), &["land"]);
+    gft.run(&home, &["new", "leaf", "--on", "mid"]);
+    // A link that lands as a link: nothing reads where it points.
+    std::os::unix::fs::symlink("/dev/zero", work.join("app+leaf/zero")).unwrap();
+    gft.run(&work.join("app+leaf"), &["land", "--dry-run"]);
     {
         let mut made = made.lock().unwrap();
         assert_eq!(made.pulls[6]["base"], "graft/base3");
@@ -1068,6 +1072,9 @@ fn copies_built_on_merged_work_move_onto_main_with_it() {
     assert!(!synced.contains("new one") && !synced.contains("builds on main"), "{synced}");
     let refused = gft.try_run(&work.join("app+mid"), &["land"]);
     assert!(String::from_utf8_lossy(&refused.stderr).contains("#7 was merged into graft/base3, not main"));
+    // Nor is the copy built on it moved onto main, which has none of their work yet.
+    let synced = gft.run(&work.join("app+leaf"), &["sync"]);
+    assert!(!synced.contains("builds on main"), "{synced}");
 }
 
 #[test]

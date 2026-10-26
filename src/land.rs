@@ -63,7 +63,7 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
     // Built on work merged since: its files still have that work as it was, and sync
     // takes in the merged version.
     if let Some(stacked) = &copy.stacked
-        && let Some(merged) = merged_pull(&github, repo, stacked)?
+        && let Some(merged) = merged_pull(&github, repo, stacked, &project.branch)?
     {
         bail!(
             "{} was merged (pull request #{merged}); `gft sync {name}` to move onto {} with it, then land",
@@ -402,15 +402,21 @@ fn head_of(github: &GitHub, branch: &str) -> Result<Option<String>> {
         .transpose()
 }
 
-/// The number of the merged pull request that carried `landing`, if there is one: one
-/// from its branch whose last commit has the landing's. A branch name used again
-/// after an earlier pull request from it was merged doesn't count as merged.
-pub fn merged_pull(github: &GitHub, repo: &str, landing: &Landing) -> Result<Option<u64>> {
+/// The number of the pull request that carried `landing` into the branch `into` (the
+/// default branch), if one did: one from its branch whose last commit has the
+/// landing's. A branch name used again after an earlier pull request from it was
+/// merged doesn't count, nor does one merged into another copy's branch, whose work
+/// reaches `into` only once that one does.
+pub fn merged_pull(github: &GitHub, repo: &str, landing: &Landing, into: &str) -> Result<Option<u64>> {
     let owner = repo.split('/').next().expect("owner/name");
     let found = github.call("GET", &format!("pulls?head={owner}:{}&state=closed", landing.branch), None)?;
     for pull in found.as_array().map(Vec::as_slice).unwrap_or_default() {
         let head = pull["head"]["sha"].as_str().unwrap_or_default();
-        if pull["merged_at"].is_string() && !head.is_empty() && contains(github, head, &landing.commit)? {
+        if pull["merged_at"].is_string()
+            && pull["base"]["ref"] == into
+            && !head.is_empty()
+            && contains(github, head, &landing.commit)?
+        {
             return Ok(pull["number"].as_u64());
         }
     }

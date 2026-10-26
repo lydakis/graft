@@ -920,7 +920,12 @@ fn marked(copy: &Copy, everywhere: bool) -> Result<BTreeSet<String>> {
     }
     let mut marked = BTreeSet::new();
     for path in &paths {
-        let Ok(data) = std::fs::read(copy.dir.join(path)) else { continue };
+        // Only a file's own bytes land: a link lands as where it points, unread.
+        let file = copy.dir.join(path);
+        if !std::fs::symlink_metadata(&file).is_ok_and(|meta| meta.is_file()) {
+            continue;
+        }
+        let Ok(data) = std::fs::read(file) else { continue };
         let lines = data.split(|&byte| byte == b'\n');
         if lines.into_iter().any(|line| line.starts_with(b"<<<<<<< yours") || line.starts_with(b">>>>>>> upstream")) {
             marked.insert(path.clone());
@@ -981,7 +986,7 @@ fn merged(project: &Project, copy: &Copy, name: &str) -> Result<Option<Merged>> 
         return Ok(Some(Merged { commit: landed.commit.clone(), said, done: true, github }));
     }
     let Some(stacked) = &copy.stacked else { return Ok(None) };
-    let Some(number) = land::merged_pull(&github, &project.repo, stacked)? else { return Ok(None) };
+    let Some(number) = land::merged_pull(&github, &project.repo, stacked, &project.branch)? else { return Ok(None) };
     let mut said = format!("{} was merged (#{number}); {name} now builds on {}", stacked.branch, project.branch);
     // GitHub closes a pull request whose base branch goes, and it can't be reopened.
     let closed = pull.as_ref().filter(|(_, pull)| pull["state"] != "open");
