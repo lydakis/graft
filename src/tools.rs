@@ -58,8 +58,11 @@ pub fn changes(name: &str, since: Option<&str>, dir: &Path) -> Result<Vec<Change
             _ => bail!("unexpected line from sandfs changes: {line:?}"),
         })
         .collect::<Result<Vec<_>>>()?;
-    // A path below a link, as a deleted file is when a link replaced its folder, is no
-    // file git could ignore, and git refuses to look past the link.
+    // Against the base, only an added file can be one git ignores: the others are the
+    // base commit's own files, whatever the index says after `git rm`. Between copies,
+    // either may have build output the other lacks. A path below a link, as a deleted
+    // file is when a link replaced its folder, is no file git could ignore, and git
+    // refuses to look past the link.
     let mut links = HashMap::new();
     let mut below_link = |path: &str| {
         Path::new(path).ancestors().skip(1).filter(|parent| !parent.as_os_str().is_empty()).any(|parent| {
@@ -68,7 +71,12 @@ pub fn changes(name: &str, since: Option<&str>, dir: &Path) -> Result<Vec<Change
             })
         })
     };
-    let asked: Vec<&str> = all.iter().map(|change| change.path.as_str()).filter(|path| !below_link(path)).collect();
+    let asked: Vec<&str> = all
+        .iter()
+        .filter(|change| since.is_some() || change.kind == 'A')
+        .map(|change| change.path.as_str())
+        .filter(|path| !below_link(path))
+        .collect();
     let ignored = ignored(dir, asked.into_iter())?;
     Ok(all.into_iter().filter(|change| !ignored.contains(&change.path)).collect())
 }

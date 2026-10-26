@@ -226,7 +226,11 @@ fn copies_are_made_compared_synced_and_landed() {
     std::fs::write(repo.join("src/lib.rs"), "fn one() {}\n\nfn two() {}\n").unwrap();
     std::fs::write(repo.join("README.md"), "hello\n").unwrap();
     std::fs::write(repo.join(".gitignore"), "/target\n").unwrap();
+    // A file kept in an ignored folder all the same.
+    std::fs::create_dir(repo.join("target")).unwrap();
+    std::fs::write(repo.join("target/keep"), "kept\n").unwrap();
     git(repo, &["add", "-A"]);
+    git(repo, &["add", "-f", "target/keep"]);
     git(repo, &["commit", "-q", "-m", "first"]);
     let first = git(repo, &["rev-parse", "HEAD"]);
 
@@ -268,6 +272,9 @@ fn copies_are_made_compared_synced_and_landed() {
     std::fs::remove_dir_all(link.join("src")).unwrap();
     std::os::unix::fs::symlink("elsewhere", link.join("src")).unwrap();
     assert_eq!(gft.run(&link, &["changes"]), "A src\nD src/lib.rs\n");
+    // A base file deleted with `git rm` is a change, though git ignores its name now.
+    git(&link, &["rm", "-q", "target/keep"]);
+    assert_eq!(gft.run(&link, &["changes"]), "A src\nD src/lib.rs\nD target/keep\n");
     gft.run(&home, &["rm", "link", "--force"]);
 
     // A snapshot, a wrong turn, and back.
