@@ -283,8 +283,17 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Diff { a, b } => {
             let (project, current) = here(&store)?;
             match (a.or(current), b) {
-                (Some(a), None) => diff(&project, copy(&project, &a)?),
-                (Some(a), Some(b)) => diff_copies(copy(&project, &a)?, copy(&project, &b)?),
+                (Some(a), None) => {
+                    let a = copy(&project, &a)?;
+                    mount_copy(a)?;
+                    diff(&project, a)
+                }
+                (Some(a), Some(b)) => {
+                    let (a, b) = (copy(&project, &a)?, copy(&project, &b)?);
+                    mount_copy(a)?;
+                    mount_copy(b)?;
+                    diff_copies(a, b)
+                }
                 (None, _) => bail!("name a copy, or run this inside one"),
             }
         }
@@ -949,16 +958,18 @@ fn list(project: &Project, print: bool) -> Result<serde_json::Value> {
     }))
 }
 
-/// Whether `path` is the same in the folders `a` and `b`: the same bytes, a link to
-/// the same place, or no file in either.
+/// Whether `path` is the same in the folders `a` and `b`: the same bytes and the same
+/// executable bit, as git sees them, a link to the same place, or no file in either.
 fn same_file(a: &Path, b: &Path, path: &str) -> bool {
-    let read = |dir: &Path| -> Option<(bool, Vec<u8>)> {
+    use std::os::unix::fs::PermissionsExt;
+    let read = |dir: &Path| -> Option<(char, Vec<u8>)> {
         let full = dir.join(path);
         let meta = std::fs::symlink_metadata(&full).ok()?;
         if meta.file_type().is_symlink() {
-            return Some((true, std::fs::read_link(&full).ok()?.into_os_string().into_encoded_bytes()));
+            return Some(('l', std::fs::read_link(&full).ok()?.into_os_string().into_encoded_bytes()));
         }
-        meta.is_file().then(|| std::fs::read(&full).ok().map(|data| (false, data))).flatten()
+        let kind = if meta.permissions().mode() & 0o111 != 0 { 'x' } else { 'f' };
+        meta.is_file().then(|| std::fs::read(&full).ok().map(|data| (kind, data))).flatten()
     };
     read(a) == read(b)
 }
@@ -1287,11 +1298,21 @@ fn marked(copy: &Copy, everywhere: bool) -> Result<BTreeSet<String>> {
     if everywhere {
         paths.extend(changes(&copy.workspace, None, &copy.dir)?.into_iter().map(|change| change.path));
     }
+    Ok(markers_in(&copy.dir, &paths))
+}
+
+/// Whether `path` is a regular file, not a link to one.
+fn regular(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+}
+
+/// Which of `paths` in the folder `dir` have Graft's conflict markers.
+fn markers_in(dir: &Path, paths: &BTreeSet<String>) -> BTreeSet<String> {
     let mut marked = BTreeSet::new();
-    for path in &paths {
+    for path in paths {
         // Only a file's own bytes land: a link lands as where it points, unread.
-        let file = copy.dir.join(path);
-        if !std::fs::symlink_metadata(&file).is_ok_and(|meta| meta.is_file()) {
+        let file = dir.join(path);
+        if !regular(&file) {
             continue;
         }
         let Ok(data) = std::fs::read(file) else { continue };
@@ -1300,7 +1321,7 @@ fn marked(copy: &Copy, everywhere: bool) -> Result<BTreeSet<String>> {
             marked.insert(path.clone());
         }
     }
-    Ok(marked)
+    marked
 }
 
 /// An unmount of the folder `dir` refused because something works in it, said
@@ -1432,7 +1453,8 @@ fn sync_saved(store: &Store, project: &Project, copy: &Copy, name: &str, merged:
         Ok(match (project.folder, merged) {
             // From the folder as the copy took it, kept before it moved.
             (true, _) => match (&folder_bases, std::fs::read(project.home.join(path))) {
-                (Some(bases), Ok(theirs)) if copy.dir.join(path).is_file() => {
+                // Only files: a link's target is no text to merge, nor a place to write.
+                (Some(bases), Ok(theirs)) if regular(&copy.dir.join(path)) && regular(&project.home.join(path)) => {
                     merge_bytes(&copy.dir, path, path, bases.get(path).cloned().flatten(), theirs)?
                 }
                 (_, Err(_)) => "deleted in the folder, changed here; kept yours".to_owned(),
@@ -1569,13 +1591,23 @@ fn sync_home(project: &Project) -> Result<usize> {
     let old = git(home, &["rev-parse", "HEAD"])?;
     let updated = sandfs()?.update(&project.workspace, None)?;
     let new = git(home, &["rev-parse", "HEAD"])?;
+    // Markers left by this sync or an earlier one count until they are settled.
+    let marked = || -> Result<usize> {
+        let changed = changes(&project.workspace, None, home)?.into_iter().map(|change| change.path).collect();
+        let marked = markers_in(home, &changed);
+        if !marked.is_empty() {
+            let paths: Vec<&str> = marked.iter().map(String::as_str).collect();
+            println!("conflict markers in: {}", paths.join(", "));
+        }
+        Ok(marked.len())
+    };
     if new == old && updated.both.is_empty() {
         println!("{} is up to date at {}", home_name(project), short(&old));
-        return Ok(0);
+        return marked();
     }
     let both = &updated.both;
     let renames = if both.is_empty() { BTreeMap::new() } else { renames(home, &old, &new)? };
-    let (conflicts, looks) = take_in(both, &renames, |path, renamed| {
+    let (_, looks) = take_in(both, &renames, |path, renamed| {
         let base = tools::git_raw(home, &["show", &format!("{old}:{path}")]).ok();
         merge(home, base, &new, path, renamed)
     })?;
@@ -1586,7 +1618,7 @@ fn sync_home(project: &Project) -> Result<usize> {
         short(&new),
         files(both.len())
     );
-    Ok(conflicts.len())
+    marked()
 }
 
 /// Merge upstream's change to `path`, from `base` (what the copy started from there;
@@ -1744,6 +1776,17 @@ mod tests {
                 .collect::<String>();
             assert_eq!(merged, expected, "{count} conflicts");
         }
+    }
+
+    #[test]
+    fn same_file_sees_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(a.path().join("run.sh"), "echo\n").unwrap();
+        std::fs::write(b.path().join("run.sh"), "echo\n").unwrap();
+        assert!(same_file(a.path(), b.path(), "run.sh"));
+        std::fs::set_permissions(b.path().join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!same_file(a.path(), b.path(), "run.sh"));
     }
 
     #[test]

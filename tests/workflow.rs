@@ -629,6 +629,20 @@ fn copies_of_a_plain_folder_land_back_into_it() {
     gft.run(&folder, &["rm", "other"]);
     assert!(!gft.run(&folder, &["ls"]).contains("other"));
 
+    // A file the copy made a link, changed in the folder too, isn't merged through
+    // the link: what it points at stays as it was.
+    gft.run(&folder, &["new", "linked"]);
+    let linked = folder.parent().unwrap().join("notes+linked");
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("target.md"), "outside\n").unwrap();
+    std::fs::remove_file(linked.join("todo.md")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("target.md"), linked.join("todo.md")).unwrap();
+    std::fs::write(folder.join("todo.md"), "- z\n- a\n- b\n- c\n").unwrap();
+    let synced = gft.run(&linked, &["sync"]);
+    assert!(synced.contains("kept yours\ttodo.md"), "{synced}");
+    assert_eq!(std::fs::read_to_string(outside.path().join("target.md")).unwrap(), "outside\n");
+    gft.run(&folder, &["rm", "--force", "linked"]);
+
     // A folder inside another one can be a project of its own; inside it, it wins
     // (named to come after the outer one, which is looked at first).
     let inner = folder.join("zone");
@@ -1272,4 +1286,15 @@ fn copies_come_back_and_follow_upstream() {
     assert!(gft.run(&home, &["sync"]).contains("app moved from"));
     assert_eq!(git(&home, &["rev-parse", "HEAD"]), newest);
     assert!(home.join("later.txt").exists() && home.join("home.txt").exists());
+
+    // Conflicts in the home copy keep `sync` exiting with 2 until settled.
+    std::fs::write(home.join("GUIDE.md"), "zero\none at home\ntwo\nthree\n").unwrap();
+    commit_upstream(repo, "GUIDE.md", "zero\none upstream\ntwo\nthree\n");
+    assert_eq!(gft.try_run(&home, &["sync"]).status.code(), Some(2));
+    let again = gft.try_run(&home, &["sync"]);
+    assert_eq!(again.status.code(), Some(2), "{}", String::from_utf8_lossy(&again.stdout));
+
+    // A named copy is mounted before its diff is read.
+    sandfs.unmount("n.c").unwrap();
+    assert!(gft.run(&home, &["diff", "c"]).contains("+noted differently"));
 }
