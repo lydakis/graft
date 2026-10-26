@@ -547,16 +547,21 @@ fn files(n: usize) -> String {
 
 /// How many of the copy's files would be lost: every changed one when it never
 /// landed, else each not as the last landing left it. That counts a file the landing
-/// carried and the copy put back as its base has it since, a change of its own; not
-/// one the base caught up with, as once its pull request is merged and synced.
+/// carried that the copy put back as it was before the landing, a change of its own;
+/// not one a newer base has some other way, as once its pull request is merged,
+/// upstream changes the file again, and the copy syncs.
 fn unlanded(copy: &Copy) -> Result<usize> {
     mount_copy(copy)?;
     let changed = changes(&copy.workspace, None, &copy.dir)?;
     let Some(landed) = &copy.landed else { return Ok(changed.len()) };
-    let paths: BTreeSet<&String> = changed.iter().map(|change| &change.path).chain(landed.files.keys()).collect();
+    let changed: BTreeSet<&String> = changed.iter().map(|change| &change.path).collect();
     let mut lost = 0;
-    for path in paths {
-        if landed.files.get(path) != Some(&land::fingerprint(&copy.dir, path)?) {
+    for path in changed.iter().copied().chain(landed.files.keys().filter(|path| !changed.contains(path))) {
+        let now = land::fingerprint(&copy.dir, path)?;
+        if landed.files.get(path) == Some(&now) {
+            continue;
+        }
+        if changed.contains(path) || now == land::fingerprint_at(&copy.dir, &landed.on, path)? {
             lost += 1;
         }
     }

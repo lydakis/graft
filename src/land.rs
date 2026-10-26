@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 
 use crate::github::GitHub;
 use crate::state::{Landing, Pr, Store};
-use crate::tools::{changes, git, short};
+use crate::tools::{self, changes, git, short};
 
 pub struct Options<'a> {
     pub message: Option<&'a str>,
@@ -316,6 +316,27 @@ pub fn fingerprint(dir: &Path, path: &str) -> Result<String> {
         // In hex: a link's target is any bytes, and two differing ones must not read the same.
         Some(target) => target.iter().map(|byte| format!("{byte:02x}")).collect(),
         None => git(dir, &["hash-object", "--no-filters", "--", path])?,
+    };
+    Ok(format!("{mode} {hash}"))
+}
+
+/// What `fingerprint` said of `path` in commit `commit`, read from git in the copy at
+/// `dir`, with no file's contents fetched but a link's.
+pub fn fingerprint_at(dir: &Path, commit: &str, path: &str) -> Result<String> {
+    let listed = git(dir, &["ls-tree", "-z", commit, "--", path])?;
+    // `MODE TYPE ID\tPATH`; nothing when the commit has no file there.
+    let Some((mode, rest)) = listed.trim_end_matches('\0').split_once(' ') else { return Ok("deleted".to_owned()) };
+    let Some(("blob", id)) = rest.split_once('\t').and_then(|(about, _)| about.split_once(' ')) else {
+        return Ok("deleted".to_owned());
+    };
+    let mode = match mode {
+        "120000" => "120000",
+        "100755" => "100755",
+        _ => "100644",
+    };
+    let hash = match mode {
+        "120000" => tools::git_raw(dir, &["cat-file", "blob", id])?.iter().map(|byte| format!("{byte:02x}")).collect(),
+        _ => id.to_owned(),
     };
     Ok(format!("{mode} {hash}"))
 }

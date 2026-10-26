@@ -654,4 +654,18 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
     assert!(landed.contains("0 files"), "{landed}");
     assert_eq!(made.lock().unwrap().commits.last().unwrap()["tree"], format!("tree-of-{first}"));
     gft.run(&home, &["rm", "fix"]);
+
+    // Merged upstream, then changed there again: synced, nothing is lost by `rm`.
+    gft.run(&home, &["new", "merged"]);
+    std::fs::write(at("merged").join("merged.txt"), "landed\n").unwrap();
+    gft.run(&at("merged"), &["land"]);
+    std::fs::write(repo.join("merged.txt"), "landed\n").unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-q", "-m", "merge"]);
+    gft.run(&at("merged"), &["sync"]);
+    std::fs::write(repo.join("merged.txt"), "changed upstream since\n").unwrap();
+    git(repo, &["commit", "-q", "-am", "later"]);
+    gft.run(&at("merged"), &["sync"]);
+    assert_eq!(gft.run(&at("merged"), &["changes"]), "");
+    gft.run(&home, &["rm", "merged"]);
 }
