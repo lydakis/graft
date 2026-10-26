@@ -345,8 +345,15 @@ fn undo(store: &Store, repo: &str, name: &str, steps: usize) -> Result<()> {
     }
     let keep = copy.snapshots.len() - steps;
     let target = copy.snapshots[keep].clone();
-    sandfs(&["rm", "--unmount", &copy.workspace])?;
-    sandfs(&["fork", &target.workspace, path_str(&copy.dir)?, "--name", &copy.workspace])?;
+    if target.base == copy.base && mounted(&copy.workspace)?.is_some() {
+        // Written back through the mount, file by file, so programs working in the
+        // copy (a shell sitting in it) carry on undisturbed. Git's own files stay.
+        sandfs(&["changes", &target.workspace, "--since", &copy.workspace, "--copy-to", path_str(&copy.dir)?])?;
+    } else {
+        // A snapshot from before a sync sits on another commit: the copy is made again.
+        sandfs(&["rm", "--unmount", &copy.workspace])?;
+        sandfs(&["fork", &target.workspace, path_str(&copy.dir)?, "--name", &copy.workspace])?;
+    }
     // Snapshots newer than the one gone back to go; that one stays, to go back to again.
     for later in &copy.snapshots[keep + 1..] {
         sandfs(&["rm", &later.workspace])?;

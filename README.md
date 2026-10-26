@@ -54,7 +54,7 @@ Commands that take a copy use the one the current folder is in when none is name
 
 ## Limits
 
-- `sync`, `undo` and `rm` unmount the copy for a moment, so no program may be working inside it then (an agent's shell sitting in the folder counts). Moving a mounted copy in place is planned in sandfs.
+- `sync` unmounts the copy for a moment, so no program may be working inside it then (an agent's shell sitting in the folder counts), and so does `undo` back past a `sync`. Other undos write the snapshot back through the mount and need nothing stopped. Moving a mounted copy in place is planned in sandfs.
 - Landing uploads each changed file as one API call. A few hundred changed files take a while, and GitHub allows 5,000 calls an hour per token.
 - GitHub only, for now. Plain folders that aren't git repositories are next: there `land` will write the copy's changes back into the folder.
 

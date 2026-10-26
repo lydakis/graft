@@ -228,8 +228,16 @@ fn copies_are_made_compared_synced_and_landed() {
     // A snapshot, a wrong turn, and back.
     gft.run(&fix, &["save", "two returns 2"]);
     std::fs::remove_file(fix.join("notes.txt")).unwrap();
-    gft.run(&home, &["undo", "--copy", "fix"]);
+    std::fs::write(fix.join("stray.txt"), "oops\n").unwrap();
+    // From inside the copy, with a program working there all along.
+    let mut shell = Command::new("sleep").arg("30").current_dir(&fix).spawn().unwrap();
+    gft.run(&fix, &["undo"]);
     assert_eq!(std::fs::read_to_string(fix.join("notes.txt")).unwrap(), "why\n");
+    assert!(!fix.join("stray.txt").exists());
+    shell.kill().unwrap();
+    shell.wait().unwrap();
+    gft.run(&fix, &["save", "again"]);
+    gft.run(&home, &["undo", "--copy", "fix"]);
 
     // Upstream changes another line of the same file: sync merges it in.
     std::fs::write(repo.join("src/lib.rs"), "// lib\nfn one() {}\n\nfn two() {}\n").unwrap();
