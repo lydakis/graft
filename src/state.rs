@@ -101,6 +101,36 @@ pub struct Landing {
 pub struct Pr {
     pub number: u64,
     pub url: String,
+    /// Where Graft before 0.1 kept its last landing, read only to move it to
+    /// `Copy::landed`.
+    #[serde(default, skip_serializing, rename = "branch")]
+    old_branch: Option<String>,
+    #[serde(default, skip_serializing, rename = "landed_on")]
+    old_on: Option<String>,
+    #[serde(default, skip_serializing, rename = "landed")]
+    old_files: BTreeMap<String, String>,
+}
+
+impl Pr {
+    pub fn new(number: u64, url: String) -> Pr {
+        Pr { number, url, old_branch: None, old_on: None, old_files: BTreeMap::new() }
+    }
+}
+
+/// A project as read from its file, with a landing that Graft before 0.1 kept with
+/// the pull request moved to where it is kept now. That Graft didn't keep the commit
+/// it left the branch at, so the commit is left empty, for `land` to take the
+/// branch's as the copy's own.
+fn read(data: &[u8]) -> serde_json::Result<Project> {
+    let mut project: Project = serde_json::from_slice(data)?;
+    for copy in project.copies.values_mut() {
+        let Some(pr) = &mut copy.pr else { continue };
+        if let (Some(branch), Some(on), None) = (pr.old_branch.take(), pr.old_on.take(), &copy.landed) {
+            let files = std::mem::take(&mut pr.old_files);
+            copy.landed = Some(Landing { branch, commit: String::new(), on, files });
+        }
+    }
+    Ok(project)
 }
 
 /// A copy as it was at one moment, kept as an unmounted sandfs workspace.
@@ -143,7 +173,7 @@ impl Store {
     pub fn load(&self, repo: &str) -> Result<Project> {
         let path = self.file(repo, "json");
         let data = std::fs::read(&path).with_context(|| format!("no project {repo}"))?;
-        serde_json::from_slice(&data).with_context(|| format!("reading {}", path.display()))
+        read(&data).with_context(|| format!("reading {}", path.display()))
     }
 
     fn save(&self, project: &Project) -> Result<()> {
@@ -189,7 +219,7 @@ impl Store {
                 let path = entry.path();
                 if path.extension().is_some_and(|ext| ext == "json") {
                     let data = std::fs::read(&path)?;
-                    found.push(serde_json::from_slice(&data).with_context(|| format!("reading {}", path.display()))?);
+                    found.push(read(&data).with_context(|| format!("reading {}", path.display()))?);
                 }
             }
         }
@@ -242,6 +272,21 @@ pub fn check_copy_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::check_copy_name;
+
+    #[test]
+    fn a_landing_kept_with_the_pull_request_moves_to_the_copy() {
+        let old = br#"{"repo": "o/n", "source": "s", "home": "/h", "workspace": "n", "branch": "main",
+            "copies": {"fix": {"dir": "/h+fix", "workspace": "n.fix", "base": "b2",
+                "pr": {"number": 3, "url": "u", "branch": "graft/fix", "landed_on": "b1",
+                    "landed": {"a.txt": "100644 abc"}}}}}"#;
+        let project = super::read(old).unwrap();
+        let copy = &project.copies["fix"];
+        let landed = copy.landed.as_ref().unwrap();
+        assert_eq!((landed.branch.as_str(), landed.commit.as_str(), landed.on.as_str()), ("graft/fix", "", "b1"));
+        assert_eq!(landed.files["a.txt"], "100644 abc");
+        let saved = serde_json::to_value(&project).unwrap();
+        assert_eq!(saved["copies"]["fix"]["pr"], serde_json::json!({"number": 3, "url": "u"}));
+    }
 
     fn refusal(name: &str) -> String {
         check_copy_name(name).unwrap_err().to_string()

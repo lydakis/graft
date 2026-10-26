@@ -15,6 +15,7 @@
 //! them.
 
 use std::collections::BTreeMap;
+use std::io::ErrorKind;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -55,6 +56,12 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
         } else if head.as_ref() != copy.landed.as_ref().map(|landed| &landed.commit) {
             copy.pending = Some(pending);
         }
+    }
+    // Graft before 0.1 didn't keep the commit its landing left the branch at.
+    if let (Some(landed), Some(head)) = (&mut copy.landed, &head)
+        && landed.commit.is_empty()
+    {
+        landed.commit = head.clone();
     }
     // The branch's last commit is this copy's own only when its last landing left it
     // there. Matching files don't make it so: someone else's branch stays theirs.
@@ -243,10 +250,10 @@ fn open_pr(github: &GitHub, repo: &str, branch: &str) -> Result<Option<Pr>> {
 }
 
 fn as_pr(pull: &Value) -> Result<Pr> {
-    Ok(Pr {
-        number: pull["number"].as_u64().context("GitHub gave no pull request number")?,
-        url: pull["html_url"].as_str().unwrap_or_default().to_owned(),
-    })
+    Ok(Pr::new(
+        pull["number"].as_u64().context("GitHub gave no pull request number")?,
+        pull["html_url"].as_str().unwrap_or_default().to_owned(),
+    ))
 }
 
 /// The id of the tree of `commit`.
@@ -288,14 +295,22 @@ fn mode(path: &Path) -> Result<(&'static str, Option<Vec<u8>>)> {
 /// same second as the landing). A file that `gft sync` merged upstream lines into
 /// reads as changed, which it is: landing again would add a commit.
 pub fn fingerprint(dir: &Path, path: &str) -> Result<String> {
-    let full = dir.join(path);
-    match std::fs::symlink_metadata(&full) {
-        Ok(meta) if !meta.is_dir() => {}
-        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
-            return Err(err).with_context(|| format!("reading {}", full.display()));
+    // No file there: nothing at the path, a folder, or a file or link in place of a
+    // folder above it, as when a link replaced a folder of the copy's base.
+    for at in Path::new(path).ancestors().filter(|at| !at.as_os_str().is_empty()) {
+        let full = dir.join(at);
+        let is_file = match std::fs::symlink_metadata(&full) {
+            Ok(meta) => !meta.is_dir(),
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                return Ok("deleted".to_owned());
+            }
+            Err(err) => return Err(err).with_context(|| format!("reading {}", full.display())),
+        };
+        if is_file != (at == Path::new(path)) {
+            return Ok("deleted".to_owned());
         }
-        _ => return Ok("deleted".to_owned()),
     }
+    let full = dir.join(path);
     let (mode, link) = mode(&full)?;
     let hash = match link {
         // In hex: a link's target is any bytes, and two differing ones must not read the same.
@@ -303,4 +318,24 @@ pub fn fingerprint(dir: &Path, path: &str) -> Result<String> {
         None => git(dir, &["hash-object", "--no-filters", "--", path])?,
     };
     Ok(format!("{mode} {hash}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fingerprint;
+
+    #[test]
+    fn a_path_below_a_file_or_link_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        std::fs::write(dir.join("src"), "a file where a folder was\n").unwrap();
+        std::fs::create_dir_all(dir.join("elsewhere/inner")).unwrap();
+        std::fs::write(dir.join("elsewhere/inner/lib.rs"), "fn x() {}\n").unwrap();
+        std::os::unix::fs::symlink("elsewhere", dir.join("linked")).unwrap();
+        assert_eq!(fingerprint(dir, "src/lib.rs").unwrap(), "deleted");
+        assert_eq!(fingerprint(dir, "linked/inner/lib.rs").unwrap(), "deleted");
+        assert_eq!(fingerprint(dir, "missing/lib.rs").unwrap(), "deleted");
+        assert_eq!(fingerprint(dir, "elsewhere").unwrap(), "deleted");
+        assert!(fingerprint(dir, "linked").unwrap().starts_with("120000 "));
+    }
 }
