@@ -45,7 +45,7 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
     let mut copy = crate::copy(&project, name)?.clone();
     crate::mount_copy(&copy)?;
     // Conflict markers a sync left are no change anyone means to publish.
-    let marked = crate::marked(&copy)?;
+    let marked = crate::marked(&copy, true)?;
     if !options.dry_run && marked != copy.conflicts {
         record(store, repo, name, |copy| copy.conflicts = marked.clone())?;
     }
@@ -63,7 +63,7 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
     // Built on work merged since: its files still have that work as it was, and sync
     // takes in the merged version.
     if let Some(stacked) = &copy.stacked
-        && let Some(merged) = merged_pull(&github, repo, &stacked.branch)?
+        && let Some(merged) = merged_pull(&github, repo, stacked)?
     {
         bail!(
             "{} was merged (pull request #{merged}); `gft sync {name}` to move onto {} with it, then land",
@@ -391,17 +391,19 @@ fn head_of(github: &GitHub, branch: &str) -> Result<Option<String>> {
         .transpose()
 }
 
-/// The number of the merged pull request from `branch`, if there is one.
-pub fn merged_pull(github: &GitHub, repo: &str, branch: &str) -> Result<Option<u64>> {
+/// The number of the merged pull request that carried `landing`, if there is one: one
+/// from its branch whose last commit has the landing's. A branch name used again
+/// after an earlier pull request from it was merged doesn't count as merged.
+pub fn merged_pull(github: &GitHub, repo: &str, landing: &Landing) -> Result<Option<u64>> {
     let owner = repo.split('/').next().expect("owner/name");
-    let found = github.call("GET", &format!("pulls?head={owner}:{branch}&state=closed"), None)?;
-    Ok(found
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-        .iter()
-        .find(|pull| pull["merged_at"].is_string())
-        .and_then(|pull| pull["number"].as_u64()))
+    let found = github.call("GET", &format!("pulls?head={owner}:{}&state=closed", landing.branch), None)?;
+    for pull in found.as_array().map(Vec::as_slice).unwrap_or_default() {
+        let head = pull["head"]["sha"].as_str().unwrap_or_default();
+        if pull["merged_at"].is_string() && !head.is_empty() && contains(github, head, &landing.commit)? {
+            return Ok(pull["number"].as_u64());
+        }
+    }
+    Ok(None)
 }
 
 /// Whether `commit` has `ancestor` in its history, as GitHub sees it. A commit

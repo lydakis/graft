@@ -89,7 +89,35 @@ fn pull_json(made: &Made, n: usize) -> Value {
         "state": pull.get("state").cloned().unwrap_or(json!("open")),
         "merged_at": pull.get("merged_at").cloned().unwrap_or(Value::Null),
         "merge_commit_sha": pull.get("merge_commit_sha").cloned().unwrap_or(Value::Null),
-        "head": {"ref": pull["head"]}, "base": {"ref": pull["base"]}})
+        "head": {"ref": pull["head"], "sha": pull.get("head_sha").cloned().unwrap_or(Value::Null)},
+        "base": {"ref": pull["base"]}})
+}
+
+/// Keep the last commit of the branch `branch` with each pull request from it.
+fn track_heads(made: &mut Made, branch: &str, sha: &str) {
+    for pull in made.pulls.iter_mut().filter(|pull| pull["head"] == branch) {
+        pull["head_sha"] = json!(sha);
+    }
+}
+
+/// Whether `to` has `from` in its history: through the commits landing made, then
+/// the repository's.
+fn is_ancestor(made: &Made, from: &str, to: &str) -> bool {
+    if from == to {
+        return true;
+    }
+    if let Some(commit) = made.commits.iter().find(|commit| commit["sha"] == to) {
+        let parents = commit["parents"].as_array().cloned().unwrap_or_default();
+        return parents.iter().any(|parent| is_ancestor(made, from, parent.as_str().unwrap_or_default()));
+    }
+    Command::new("git")
+        .arg("-C")
+        .arg(made.repo.as_ref().unwrap())
+        .args(["merge-base", "--is-ancestor", from, to])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
 }
 
 /// Answers the calls `gft land` makes, keeping what it was sent.
@@ -173,7 +201,9 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
                 }
                 ("POST", "git/refs") => {
                     let name = body["ref"].as_str().unwrap().trim_start_matches("refs/").to_owned();
-                    made.refs.insert(name, body["sha"].as_str().unwrap().to_owned());
+                    let sha = body["sha"].as_str().unwrap().to_owned();
+                    track_heads(&mut made, name.trim_start_matches("heads/"), &sha);
+                    made.refs.insert(name, sha);
                     if std::mem::take(&mut made.lose_ref) {
                         (502, json!({"message": "cut short"}))
                     } else {
@@ -181,7 +211,9 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
                     }
                 }
                 ("PATCH", p) if p.starts_with("git/refs/") => {
-                    made.refs.insert(p["git/refs/".len()..].to_owned(), body["sha"].as_str().unwrap().to_owned());
+                    let sha = body["sha"].as_str().unwrap().to_owned();
+                    track_heads(&mut made, p["git/refs/heads/".len()..].trim_end(), &sha);
+                    made.refs.insert(p["git/refs/".len()..].to_owned(), sha);
                     if std::mem::take(&mut made.lose_ref) {
                         (502, json!({"message": "cut short"}))
                     } else {
@@ -205,13 +237,7 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
                 }
                 ("GET", p) if p.starts_with("compare/") => {
                     let (from, to) = p["compare/".len()..].split_once("...").unwrap();
-                    let ancestor = Command::new("git")
-                        .arg("-C")
-                        .arg(made.repo.as_ref().unwrap())
-                        .args(["merge-base", "--is-ancestor", from, to])
-                        .status()
-                        .unwrap()
-                        .success();
+                    let ancestor = is_ancestor(&made, from, to);
                     let status = match (from == to, ancestor) {
                         (true, _) => "identical",
                         (false, true) => "ahead",
@@ -237,6 +263,8 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
                 }
                 ("POST", "pulls") if std::mem::take(&mut made.fail_pull) => (502, json!({"message": "cut short"})),
                 ("POST", "pulls") => {
+                    let mut body = body;
+                    body["head_sha"] = json!(made.refs.get(&format!("heads/{}", body["head"].as_str().unwrap())));
                     made.pulls.push(body);
                     let n = made.pulls.len();
                     match std::mem::take(&mut made.lose_pull) {
@@ -894,11 +922,17 @@ fn conflicts_hold_landing_until_settled() {
     let plan = gft.run(&copy, &["land", "-n", "--allow-conflicts"]);
     assert!(plan.contains("M README.md"), "{plan}");
     // Settled, it lands.
+    gft.run(&copy, &["save", "with markers"]);
     std::fs::write(copy.join("README.md"), "one\nTWO upstream\nthree\n").unwrap();
     assert!(!gft.run(&copy, &["status"]).contains("conflicts"));
     gft.run(&copy, &["land"]);
     assert_eq!(made.lock().unwrap().commits.len(), 1);
     gft.run(&copy, &["sync"]);
+    // Undone back to before they were settled, the markers count again.
+    gft.run(&copy, &["undo"]);
+    assert!(gft.run(&copy, &["status"]).contains("conflicts  README.md"));
+    let refused = gft.try_run(&copy, &["land"]);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("still has conflict markers"));
 }
 
 #[test]
@@ -1070,14 +1104,20 @@ fn many_new_copies_at_once_and_dropping_the_project() {
         assert_eq!(git(&work.join(format!("app+c{n}")), &["rev-parse", "HEAD"]), newest);
     }
 
-    // Dropping the project keeps copies with work that never landed, unless forced.
+    // Dropping the project keeps copies with work that never landed, and work in
+    // the home copy, unless forced.
     std::fs::write(work.join("app+c0/work.txt"), "work\n").unwrap();
+    std::fs::write(home.join("home.txt"), "work at home\n").unwrap();
     let kept = gft.try_run(&home, &["drop"]);
     assert!(String::from_utf8_lossy(&kept.stderr).contains("c0 has 1 file that never landed"));
     assert!(work.join("app+c1").join("README.md").exists());
+    gft.run(&home, &["rm", "--force", "c0"]);
+    let kept = gft.try_run(&home, &["drop"]);
+    assert!(String::from_utf8_lossy(&kept.stderr).contains("has 1 file changed in it"));
+    assert!(work.join("app+c1").join("README.md").exists());
     gft.run(&work, &["drop", "o/n", "--force"]);
     assert!(!home.exists(), "home left");
-    assert!(!work.join("app+c0").exists(), "copy left");
+    assert!(!work.join("app+c1").exists(), "copy left");
     assert!(String::from_utf8_lossy(&gft.try_run(&work, &["ls"]).stderr).contains("start with `gft get"));
     // And it can start over.
     gft.run(&work, &["get", &format!("file://{}", upstream.path().display()), "app", "--github", "o/n"]);

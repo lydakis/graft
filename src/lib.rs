@@ -332,6 +332,17 @@ fn drop_project(store: &Store, project: &Project, force: bool) -> Result<()> {
     let names: Vec<String> = project.copies.keys().cloned().collect();
     if !force {
         keep_unlanded(project, &names, "gft drop --force")?;
+        // Files changed in the home copy of a repository go with its mount.
+        if !project.folder && !project.checkout && mounted(&project.workspace)?.is_some() {
+            let changed = changes(&project.workspace, None, &project.home)?.len();
+            if changed > 0 {
+                bail!(
+                    "{} has {} changed in it, which would be lost; copy them out first, or `gft drop --force`",
+                    project.home.display(),
+                    files(changed)
+                );
+            }
+        }
     }
     for name in &names {
         rm(store, &project.repo, name)?;
@@ -785,7 +796,7 @@ fn status(store: &Store) -> Result<()> {
         false => println!("on commit  {}", short(&copy.base)),
     }
     println!("changed    {files} {}", if files == 1 { "file" } else { "files" });
-    let marked = marked(copy)?;
+    let marked = marked(copy, false)?;
     if !marked.is_empty() {
         let paths: Vec<&str> = marked.iter().map(String::as_str).collect();
         println!("conflicts  {} (settle them before landing)", paths.join(", "));
@@ -859,9 +870,12 @@ fn undo(store: &Store, repo: &str, name: &str, steps: usize) -> Result<()> {
         in_use(&copy.dir, sandfs()?.remove(&copy.workspace, true))?;
         fork(&target.workspace, Some(&copy.dir), &copy.workspace)?;
     }
+    // A snapshot taken before conflicts were settled brings their markers back.
+    let marked = marked(&copy, true)?;
     store.edit(repo, |project| {
         let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
         copy.base = target.base.clone();
+        copy.conflicts = marked.clone();
         Ok(())
     })?;
     let note = if target.note.is_empty() { String::new() } else { format!(" ({})", target.note) };
@@ -896,10 +910,16 @@ fn drop_snapshot(store: &Store, repo: &str, name: &str, snapshot: &Snapshot) -> 
     sandfs()?.remove(&snapshot.workspace, false)
 }
 
-/// The files `gft sync` left with conflict markers that still have them.
-fn marked(copy: &Copy) -> Result<BTreeSet<String>> {
+/// The files `gft sync` left with conflict markers that still have them; with
+/// `everywhere`, any file the copy changed that has Graft's markers, as one put back
+/// by `undo` may.
+fn marked(copy: &Copy, everywhere: bool) -> Result<BTreeSet<String>> {
+    let mut paths = copy.conflicts.clone();
+    if everywhere {
+        paths.extend(changes(&copy.workspace, None, &copy.dir)?.into_iter().map(|change| change.path));
+    }
     let mut marked = BTreeSet::new();
-    for path in &copy.conflicts {
+    for path in &paths {
         let Ok(data) = std::fs::read(copy.dir.join(path)) else { continue };
         let lines = data.split(|&byte| byte == b'\n');
         if lines.into_iter().any(|line| line.starts_with(b"<<<<<<< yours") || line.starts_with(b">>>>>>> upstream")) {
@@ -958,7 +978,7 @@ fn merged(project: &Project, copy: &Copy, name: &str) -> Result<Option<Merged>> 
         return Ok(Some(Merged { commit: landed.commit.clone(), said, done: true, github }));
     }
     let Some(stacked) = &copy.stacked else { return Ok(None) };
-    let Some(number) = land::merged_pull(&github, &project.repo, &stacked.branch)? else { return Ok(None) };
+    let Some(number) = land::merged_pull(&github, &project.repo, stacked)? else { return Ok(None) };
     let mut said = format!("{} was merged (#{number}); {name} now builds on {}", stacked.branch, project.branch);
     // GitHub closes a pull request whose base branch goes, and it can't be reopened.
     let closed = pull.as_ref().filter(|(_, pull)| pull["state"] != "open");
@@ -977,16 +997,17 @@ fn sync(store: &Store, repo: &str, name: &str) -> Result<usize> {
     let merged = merged(&project, &copy, name)?;
     let saved = save_unless_saved(store, repo, name, "before sync")?;
     let synced = sync_saved(store, &project, &copy, name, merged.as_ref());
-    // A snapshot of a copy the sync didn't touch only clutters the list.
+    // A snapshot of a copy the sync didn't touch only clutters the list. One that
+    // failed may have changed files before it did, so its snapshot stays.
     if let Some(snapshot) = saved
-        && synced.as_ref().map_or(true, |moved| !moved)
+        && matches!(synced, Ok(false))
     {
         drop_snapshot(store, repo, name, &snapshot)?;
     }
     synced?;
     // Conflicts left by this sync or an earlier one count until they are settled.
     let project = store.load(repo)?;
-    let marked = marked(self::copy(&project, name)?)?;
+    let marked = marked(self::copy(&project, name)?, false)?;
     if !marked.is_empty() {
         let paths: Vec<&str> = marked.iter().map(String::as_str).collect();
         println!("conflict markers in: {}", paths.join(", "));
