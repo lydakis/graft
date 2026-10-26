@@ -1088,6 +1088,12 @@ fn copies_built_on_merged_work_move_onto_main_with_it() {
     }
     let synced = gft.run(&work.join("app+leaf"), &["sync"]);
     assert!(synced.contains("graft/mid was merged (#7); leaf now builds on main"), "{synced}");
+    // The copy merged on the way merges upstream's later edits from what it landed.
+    commit_upstream(repo, "mid.txt", "y\nupstream\n");
+    let synced = gft.run(&work.join("app+mid"), &["sync"]);
+    assert!(synced.contains("#7 was merged; mid lands next as a new one"), "{synced}");
+    assert!(!synced.contains("conflict"), "{synced}");
+    assert_eq!(std::fs::read_to_string(work.join("app+mid/mid.txt")).unwrap(), "y\nupstream\n");
 }
 
 #[test]

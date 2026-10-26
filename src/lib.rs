@@ -979,8 +979,9 @@ fn merged(project: &Project, copy: &Copy, name: &str) -> Result<Option<Merged>> 
     // copy it was built on is in the default branch only once that one is.
     if let (Some((number, pull)), Some(landed)) = (&pull, &copy.landed)
         && pull["merged_at"].is_string()
-        && pull["base"]["ref"] == project.branch.as_str()
         && !landed.commit.is_empty()
+        && (pull["base"]["ref"] == project.branch.as_str()
+            || land::merged_pull(&github, &project.repo, landed, &project.branch)?.is_some())
     {
         let said = format!("pull request #{number} was merged; {name} lands next as a new one");
         return Ok(Some(Merged { commit: landed.commit.clone(), said, done: true, github }));
