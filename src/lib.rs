@@ -435,12 +435,17 @@ fn get_checkout(store: &Store, folder: &Path, github: Option<String>) -> Result<
     if let Some(other) = store.projects()?.into_iter().find(|project| project.workspace == name) {
         bail!("{} is already a project named {name}; Graft names a project after its folder", other.home.display());
     }
-    // Pull requests go against the default branch as the checkout last heard of it.
-    let branch = git(&folder, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+    // Pull requests go against the default branch: as the checkout last heard of it
+    // from origin, else as GitHub says.
+    let known = git(&folder, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .ok()
-        .and_then(|branch| branch.strip_prefix("origin/").map(str::to_owned))
-        .or_else(|| git(&folder, &["symbolic-ref", "--short", "HEAD"]).ok())
-        .unwrap_or_else(|| "main".to_owned());
+        .and_then(|branch| branch.strip_prefix("origin/").map(str::to_owned));
+    let branch = match known {
+        Some(branch) => branch,
+        None => github::GitHub::new(&slug)
+            .and_then(|github| github.default_branch())
+            .with_context(|| format!("asking GitHub for {slug}'s default branch, which pull requests go against"))?,
+    };
     let project = Project {
         repo: slug.clone(),
         source: path_str(&folder)?.to_owned(),

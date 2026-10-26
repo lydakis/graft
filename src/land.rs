@@ -102,6 +102,13 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
     if first_on.as_ref() != Some(&copy.base) {
         parents.push(copy.base.clone());
     }
+    // A copy of a checkout sits on the checkout's commit, which may not be pushed.
+    let base_tree = match github.get_opt(&format!("git/commits/{}", copy.base))? {
+        Some(commit) => {
+            commit["tree"]["sha"].as_str().map(str::to_owned).context("GitHub gave a commit without a tree")?
+        }
+        None => bail!("{name} sits on commit {}, which GitHub doesn't have: push it first", short(&copy.base)),
+    };
     if options.dry_run {
         let pr = copy.pr.as_ref().filter(|_| head.is_some());
         return preview(name, &branch, &pr_base, head.as_deref(), &parents, pr, &changed, ours.is_none());
@@ -116,13 +123,6 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
     };
     let describe = |number: u64| github.call("PATCH", &format!("pulls/{number}"), Some(&json!({"body": body})));
 
-    // A copy of a checkout sits on the checkout's commit, which may not be pushed.
-    let base_tree = match github.get_opt(&format!("git/commits/{}", copy.base))? {
-        Some(commit) => {
-            commit["tree"]["sha"].as_str().map(str::to_owned).context("GitHub gave a commit without a tree")?
-        }
-        None => bail!("{name} sits on commit {}, which GitHub doesn't have: push it first", short(&copy.base)),
-    };
     let mut entries = Vec::new();
     let mut files = BTreeMap::new();
     for change in &changed {

@@ -86,7 +86,7 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
             let body: Value = if body.is_empty() { Value::Null } else { serde_json::from_slice(&body).unwrap() };
-            let path = path.split_once("/repos/o/n/").unwrap().1.to_owned();
+            let path = path.split_once("/repos/o/n").unwrap().1.trim_start_matches('/').to_owned();
             let mut made = state.lock().unwrap();
             let (status, answer) = match (method.as_str(), path.as_str()) {
                 ("GET", p) if p.starts_with("git/commits/") => {
@@ -98,6 +98,7 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
                         .map_or(format!("tree-of-{id}"), |n| made.commits[n]["tree"].as_str().unwrap().to_owned());
                     (200, json!({"sha": id, "tree": {"sha": tree}}))
                 }
+                ("GET", "") => (200, json!({"default_branch": "main"})),
                 ("POST", "git/blobs") => {
                     use base64::Engine;
                     let data =
@@ -719,11 +720,15 @@ fn copies_of_a_checkout_start_from_its_work() {
     std::fs::write(app.join("new.txt"), "new\n").unwrap();
     let head = git(&app, &["rev-parse", "HEAD"]);
 
+    // On a branch of its own, with no word from origin on its default branch:
+    // GitHub says which it is.
+    git(&app, &["remote", "set-head", "origin", "--delete"]);
+    git(&app, &["checkout", "-q", "-b", "feature"]);
     // Its origin isn't on GitHub, so it needs saying where copies land.
     let refused = gft.try_run(&work, &["get", "./app"]);
     assert!(String::from_utf8_lossy(&refused.stderr).contains("isn't on GitHub"));
     gft.run(&work, &["get", "./app", "--github", "o/n"]);
-    assert!(gft.run(&app, &["ls"]).contains("(checkout, "));
+    assert!(gft.run(&app, &["ls"]).contains("(checkout, main)"));
 
     // A copy has the checkout's uncommitted work; the checkout keeps it too.
     gft.run(&app, &["new", "try"]);
