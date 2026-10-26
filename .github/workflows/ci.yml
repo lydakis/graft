@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Install FUSE and sandfs
+        run: |
+          sudo apt-get update && sudo apt-get install -y fuse3
+          cargo install --locked --git https://github.com/lydakis/sandfs sandfs-cli
+      - name: Run tests
+        run: cargo test
+        env:
+          GRAFT_REQUIRE_SANDFS: "1"

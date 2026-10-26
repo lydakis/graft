@@ -1,0 +1,32 @@
+[package]
+name = "graft"
+version = "0.1.0"
+edition = "2024"
+description = "Work in instant copies of a GitHub repository, built on sandfs: nothing cloned, each copy lands as a pull request"
+license = "MIT"
+repository = "https://github.com/lydakis/graft"
+publish = false
+default-run = "gft"
+
+[[bin]]
+name = "gft"
+path = "src/bin/gft.rs"
+
+[[bin]]
+name = "graft"
+path = "src/bin/graft.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+base64 = "0.22"
+serde_json = "1"
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
