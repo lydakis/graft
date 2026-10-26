@@ -23,7 +23,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::state::{Copy, Project, Snapshot, Store, check_copy_name};
-use crate::tools::{changes, ensure_mounted, git, mounted, path_str, sandfs, short};
+use crate::tools::{changes, copy_changes, ensure_mounted, fork, git, mount, mounted, path_str, sandfs, short};
 
 #[derive(Parser)]
 #[command(name = "gft", version, about = "Work in instant copies of a GitHub repository, built on sandfs")]
@@ -139,6 +139,9 @@ fn read_body(path: &Path) -> Result<String> {
 }
 
 pub fn main() {
+    // sandfs serves mounts from a process of its own, which is this program run again
+    // as `gft sandfs ...`.
+    sandfs::handle_relaunch(&["sandfs"]);
     if let Err(err) = run(Cli::parse()) {
         eprintln!("gft: {err:#}");
         std::process::exit(1);
@@ -359,7 +362,7 @@ fn get(store: &Store, repo: &str, dir: Option<PathBuf>, github: Option<String>) 
     if store.exists(&slug) {
         bail!("{slug} is already a project here; its home copy is listed by `gft ls`");
     }
-    sandfs(&["mount", &source, path_str(&dir)?, "--name", &name])?;
+    mount(&source, &dir, &name)?;
     let dir = dir.canonicalize()?;
     let mut project = Project {
         repo: slug.clone(),
@@ -371,7 +374,7 @@ fn get(store: &Store, repo: &str, dir: Option<PathBuf>, github: Option<String>) 
         copies: BTreeMap::new(),
     };
     // Kept before anything changes the home copy, as the start of every new copy.
-    sandfs(&["fork", &name, "--name", &main_workspace(&project)])?;
+    fork(&name, None, &main_workspace(&project))?;
     project.branch = git(&dir, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_else(|_| "main".to_owned());
     let commit = git(&dir, &["rev-parse", "HEAD"])?;
     store.create(&project)?;
@@ -428,7 +431,7 @@ fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
         None => {
             // Brings the default branch up to date once for all the copies made now.
             let main = main_workspace(&project);
-            sandfs(&["update", &main])?;
+            sandfs()?.update(&main, None)?;
             (main, None)
         }
     };
@@ -437,7 +440,7 @@ fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
     for name in names {
         let dir = parent.join(format!("{home_name}+{name}"));
         let workspace = format!("{}.{name}", project.workspace);
-        sandfs(&["fork", &source, path_str(&dir)?, "--name", &workspace])?;
+        fork(&source, Some(&dir), &workspace)?;
         let commit = match &base {
             Some(commit) => commit.clone(),
             None if project.folder => folder_base(),
@@ -566,7 +569,7 @@ fn save(store: &Store, repo: &str, name: &str, note: &str) -> Result<Snapshot> {
         Ok((copy.workspace.clone(), copy.next - 1))
     })?;
     let snapshot_name = format!("{workspace}.{n}");
-    sandfs(&["fork", &workspace, "--name", &snapshot_name])?;
+    fork(&workspace, None, &snapshot_name)?;
     store.edit(repo, |project| {
         let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
         let snapshot =
@@ -611,15 +614,15 @@ fn undo(store: &Store, repo: &str, name: &str, steps: usize) -> Result<()> {
     if target.base == copy.base && mounted(&copy.workspace)?.is_some() {
         // Written back through the mount, file by file, so programs working in the
         // copy (a shell sitting in it) carry on undisturbed. Git's own files stay.
-        sandfs(&["changes", &target.workspace, "--since", &copy.workspace, "--copy-to", path_str(&copy.dir)?])?;
+        copy_changes(&target.workspace, Some(&copy.workspace), &copy.dir)?;
     } else {
         // A snapshot from before a sync sits on another commit: the copy is made again.
-        in_use(copy, sandfs(&["rm", "--unmount", &copy.workspace]))?;
-        sandfs(&["fork", &target.workspace, path_str(&copy.dir)?, "--name", &copy.workspace])?;
+        in_use(copy, sandfs()?.remove(&copy.workspace, true))?;
+        fork(&target.workspace, Some(&copy.dir), &copy.workspace)?;
     }
     // Snapshots newer than the one gone back to go; that one stays, to go back to again.
     for later in &copy.snapshots[keep + 1..] {
-        sandfs(&["rm", &later.workspace])?;
+        sandfs()?.remove(&later.workspace, false)?;
     }
     store.edit(repo, |project| {
         let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
@@ -653,7 +656,7 @@ fn sync(store: &Store, repo: &str, name: &str) -> Result<()> {
     let copy = copy(&project, name)?.clone();
     mount_copy(&copy)?;
     // Moved in place, so programs working in the copy carry on.
-    let (out, _) = sandfs(&["update", &copy.workspace])?;
+    let updated = sandfs()?.update(&copy.workspace, None)?;
     let new = match project.folder {
         true => folder_base(),
         false => git(&copy.dir, &["rev-parse", "HEAD"])?,
@@ -663,9 +666,9 @@ fn sync(store: &Store, repo: &str, name: &str) -> Result<()> {
         copy.base = new.clone();
         Ok(())
     })?;
-    let both: Vec<&str> = out.lines().filter_map(|line| line.strip_prefix("C ")).collect();
+    let both = &updated.both;
     let mut conflicts = 0;
-    for path in &both {
+    for path in both {
         // A folder keeps no older version to merge from.
         let outcome = match project.folder {
             true => "changed in the folder too; kept yours",
@@ -694,8 +697,8 @@ fn land_folder(store: &Store, project: &Project, name: &str) -> Result<()> {
     if changed.is_empty() {
         bail!("{name} has no changes to land");
     }
-    sandfs(&["changes", &copy.workspace, "--copy-to", path_str(&project.home)?])?;
-    sandfs(&["update", &copy.workspace])?;
+    copy_changes(&copy.workspace, None, &project.home)?;
+    sandfs()?.update(&copy.workspace, None)?;
     store.edit(&project.repo, |project| {
         let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
         copy.base = folder_base();
@@ -746,12 +749,12 @@ fn rm(store: &Store, repo: &str, name: &str) -> Result<()> {
     let project = store.load(repo)?;
     let copy = copy(&project, name)?;
     if mounted(&copy.workspace)?.is_some() {
-        in_use(copy, sandfs(&["rm", "--unmount", &copy.workspace]))?;
+        in_use(copy, sandfs()?.remove(&copy.workspace, true))?;
     } else {
-        sandfs(&["rm", &copy.workspace])?;
+        sandfs()?.remove(&copy.workspace, false)?;
     }
     for snapshot in &copy.snapshots {
-        sandfs(&["rm", &snapshot.workspace])?;
+        sandfs()?.remove(&snapshot.workspace, false)?;
     }
     store.edit(repo, |project| {
         project.copies.remove(name);
