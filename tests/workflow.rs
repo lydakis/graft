@@ -697,3 +697,47 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
     assert_eq!(gft.run(&at("merged"), &["changes"]), "");
     gft.run(&home, &["rm", "merged"]);
 }
+
+#[test]
+fn copies_of_a_checkout_start_from_its_work() {
+    if !mounts() {
+        return;
+    }
+    let upstream = tempfile::Builder::new().prefix("graft-upstream").tempdir().unwrap();
+    let repo = upstream.path();
+    git(repo, &["init", "-q"]);
+    std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-q", "-m", "first"]);
+    let (api, made) = fake_github();
+    let gft = Gft { sandfs_home: tempfile::tempdir().unwrap(), graft_home: tempfile::tempdir().unwrap(), api };
+    let work = tempfile::tempdir().unwrap();
+    let work = work.path().canonicalize().unwrap();
+    git(&work, &["clone", "-q", &format!("file://{}", repo.display()), "app"]);
+    let app = work.join("app");
+    std::fs::write(app.join("README.md"), "hello, edited\n").unwrap();
+    std::fs::write(app.join("new.txt"), "new\n").unwrap();
+    let head = git(&app, &["rev-parse", "HEAD"]);
+
+    // Its origin isn't on GitHub, so it needs saying where copies land.
+    let refused = gft.try_run(&work, &["get", "./app"]);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("isn't on GitHub"));
+    gft.run(&work, &["get", "./app", "--github", "o/n"]);
+    assert!(gft.run(&app, &["ls"]).contains("(checkout, "));
+
+    // A copy has the checkout's uncommitted work; the checkout keeps it too.
+    gft.run(&app, &["new", "try"]);
+    let copy = work.join("app+try");
+    assert_eq!(std::fs::read_to_string(copy.join("README.md")).unwrap(), "hello, edited\n");
+    assert_eq!(gft.run(&copy, &["changes"]), "M README.md\nA new.txt\n");
+    assert_eq!(std::fs::read_to_string(app.join("README.md")).unwrap(), "hello, edited\n");
+    std::fs::write(copy.join("more.txt"), "more\n").unwrap();
+    gft.run(&copy, &["land"]);
+    assert_eq!(made.lock().unwrap().commits[0]["parents"], json!([head]));
+
+    // Committed in the checkout, the edit is the base's once the copy syncs.
+    git(&app, &["commit", "-q", "-am", "edit"]);
+    gft.run(&copy, &["sync"]);
+    assert_eq!(gft.run(&copy, &["changes"]), "A more.txt\nA new.txt\n");
+    gft.run(&app, &["rm", "--force", "try"]);
+}

@@ -189,6 +189,7 @@ fn run(cli: Cli) -> Result<()> {
                         Ok((copy.workspace.clone(), copy.dir.clone()))
                     }
                     None if project.folder => bail!("name a copy: the folder itself is what copies change"),
+                    None if project.checkout => bail!("name a copy; in the checkout itself, `git status` says"),
                     None => Ok((project.workspace.clone(), project.home.clone())),
                 }
             };
@@ -371,8 +372,14 @@ fn as_folder(repo: &str) -> Option<PathBuf> {
 
 fn get(store: &Store, repo: &str, dir: Option<PathBuf>, github: Option<String>) -> Result<()> {
     if let Some(folder) = as_folder(repo) {
-        if dir.is_some() || github.is_some() {
-            bail!("a folder is its own home copy; DIR and --github are for repositories");
+        if dir.is_some() {
+            bail!("a folder is its own home copy; DIR is for repositories on GitHub");
+        }
+        if folder.join(".git").exists() {
+            return get_checkout(store, &folder, github);
+        }
+        if github.is_some() {
+            bail!("a plain folder lands into itself; --github is for repositories");
         }
         return get_folder(store, &folder);
     }
@@ -394,6 +401,7 @@ fn get(store: &Store, repo: &str, dir: Option<PathBuf>, github: Option<String>) 
         workspace: name.clone(),
         branch: String::new(),
         folder: false,
+        checkout: false,
         takes: 0,
         copies: BTreeMap::new(),
     };
@@ -403,6 +411,52 @@ fn get(store: &Store, repo: &str, dir: Option<PathBuf>, github: Option<String>) 
     let commit = git(&dir, &["rev-parse", "HEAD"])?;
     store.create(&project)?;
     println!("{}: {slug} at {} ({})", dir.display(), short(&commit), project.branch);
+    Ok(())
+}
+
+/// Make the git checkout `folder` a project, whose home copy is the checkout itself:
+/// copies start from its commit and its uncommitted changes, and land on GitHub.
+fn get_checkout(store: &Store, folder: &Path, github: Option<String>) -> Result<()> {
+    let folder = folder.canonicalize()?;
+    let slug = match (github, git(&folder, &["remote", "get-url", "origin"]).ok()) {
+        (Some(github), _) => owner_name(&github).context("--github takes OWNER/NAME")?,
+        (None, Some(url)) => parse_repo(&url, None).map(|(slug, _)| slug).with_context(|| {
+            format!(
+                "{}'s origin, {url}, isn't on GitHub; say where copies land with --github OWNER/NAME",
+                folder.display()
+            )
+        })?,
+        (None, None) => {
+            bail!("{} has no remote named origin; say where copies land with --github OWNER/NAME", folder.display())
+        }
+    };
+    let name = folder.file_name().context("the folder has no name")?.to_string_lossy().into_owned();
+    check_copy_name(&name).with_context(|| format!("{} can't name a project", folder.display()))?;
+    if let Some(other) = store.projects()?.into_iter().find(|project| project.workspace == name) {
+        bail!("{} is already a project named {name}; Graft names a project after its folder", other.home.display());
+    }
+    // Pull requests go against the default branch as the checkout last heard of it.
+    let branch = git(&folder, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .ok()
+        .and_then(|branch| branch.strip_prefix("origin/").map(str::to_owned))
+        .or_else(|| git(&folder, &["symbolic-ref", "--short", "HEAD"]).ok())
+        .unwrap_or_else(|| "main".to_owned());
+    let project = Project {
+        repo: slug.clone(),
+        source: path_str(&folder)?.to_owned(),
+        home: folder.clone(),
+        workspace: name,
+        branch,
+        folder: false,
+        checkout: true,
+        takes: 0,
+        copies: BTreeMap::new(),
+    };
+    store.create(&project)?;
+    println!(
+        "{}: {slug} from this checkout; `gft new NAME` copies its commit and uncommitted changes next to it",
+        folder.display()
+    );
     Ok(())
 }
 
@@ -427,6 +481,7 @@ fn get_folder(store: &Store, folder: &Path) -> Result<()> {
         workspace: name,
         branch: String::new(),
         folder: true,
+        checkout: false,
         takes: 0,
         copies: BTreeMap::new(),
     };
@@ -472,8 +527,8 @@ fn new(store: &Store, names: &[String], from: Option<(&str, bool)>) -> Result<()
             }
             (from.workspace.clone(), Some(from.base.clone()))
         }
-        // Each copy is the folder as it is when made.
-        None if project.folder => (project.source.clone(), None),
+        // Each copy is the folder, or the checkout, as it is when made.
+        None if project.folder || project.checkout => (project.source.clone(), None),
         None => {
             // Brings the default branch up to date once for all the copies made now.
             let main = main_workspace(&project);
@@ -532,7 +587,11 @@ fn ls(store: &Store) -> Result<()> {
 }
 
 fn list(project: &Project) -> Result<()> {
-    let kind = if project.folder { "folder".to_owned() } else { format!("home, {}", project.branch) };
+    let kind = match (project.folder, project.checkout) {
+        (true, _) => "folder".to_owned(),
+        (_, true) => format!("checkout, {}", project.branch),
+        _ => format!("home, {}", project.branch),
+    };
     println!("{}\t{}\t({kind})", project.workspace, project.home.display());
     let mut changed: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for (name, copy) in &project.copies {
@@ -895,6 +954,7 @@ mod tests {
             workspace: "notes".into(),
             branch: String::new(),
             folder: true,
+            checkout: false,
             takes: 0,
             copies: BTreeMap::new(),
         };

@@ -38,7 +38,7 @@ gft rm --force agent-07b            # delete one anyway, losing those changes
 
 | Command | What it does |
 | --- | --- |
-| `gft get OWNER/NAME [DIR] [--github OWNER/NAME]` | Mount the default branch at DIR (default `./NAME`) as the home copy. Takes a repository URL too; for one that isn't github.com's, `--github` says where copies land. Given a folder (`./notes`, `/data/survey`), the folder itself is the home copy (see [Plain folders](#plain-folders)). |
+| `gft get OWNER/NAME [DIR] [--github OWNER/NAME]` | Mount the default branch at DIR (default `./NAME`) as the home copy. Takes a repository URL too; for one that isn't github.com's, `--github` says where copies land. Given a git checkout on this machine (`gft get .`), the checkout is the home copy: copies start from its commit and its uncommitted changes, `sync` follows its branch, and copies land on its origin on GitHub (or `--github`); the commit must be pushed before a copy of it lands. Given a plain folder (`./notes`, `/data/survey`), the folder itself is the home copy (see [Plain folders](#plain-folders)). |
 | `gft new NAME... [--from COPY \| --on COPY]` | Copies on the newest commit (fetched once for all of them), or on another copy with its changes so far. `--from` makes another attempt at the same work: its pull request goes against the default branch with all the changes. `--on` builds on top of a copy that landed: its pull request goes against that copy's branch and shows only its own changes. They appear next to the home copy as `HOME+NAME`. |
 | `gft ls` | Copies, files changed, the commit each sits on, pull requests, overlaps. Outside a copy, every project's. |
 | `gft status` | In a copy: its name, folder, commit, files changed, snapshots and pull request. In the home copy: the project and how many copies exist. |
@@ -125,7 +125,7 @@ sandfs is built into `gft`, so it needn't be installed.
 
 - `undo` back past a `sync` makes the copy again, unmounting it for a moment, so no program may be working inside it then (an agent's shell sitting in the folder counts). So does `rm`. Other undos, and `sync`, change the copy in place and need nothing stopped.
 - Landing uploads each changed file as one API call. A few hundred changed files take a while, and GitHub allows 5,000 calls an hour per token.
-- Repositories on GitHub (or a stand-in for its API), and plain folders. A folder that is a git repository is taken as a repository: `gft get OWNER/NAME`.
+- Repositories on GitHub (or a stand-in for its API), checkouts of them, and plain folders.
 
 ## Git in a copy, and what `land` sends
 

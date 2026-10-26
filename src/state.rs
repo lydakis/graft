@@ -21,10 +21,10 @@ use serde::{Deserialize, Serialize};
 pub struct Project {
     /// `owner/name` on GitHub, where copies land; `folder/name` for a plain folder.
     pub repo: String,
-    /// What sandfs mounts: the repository's URL, or the folder.
+    /// What sandfs mounts: the repository's URL, or the folder or checkout.
     pub source: String,
-    /// The home copy's folder, which tracks the default branch; for a plain folder,
-    /// the folder itself.
+    /// The home copy's folder, which tracks the default branch; for a plain folder or
+    /// a checkout, the folder itself.
     pub home: PathBuf,
     /// The sandfs workspace of the home copy, and the start of its copies' names.
     pub workspace: String,
@@ -34,6 +34,11 @@ pub struct Project {
     /// a repository on GitHub.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub folder: bool,
+    /// Whether the home copy is a git checkout on this machine, which copies start
+    /// from (its commit and uncommitted changes) and sync with, rather than a mount
+    /// of the default branch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checkout: bool,
     /// How many times copies of a plain folder took the folder as it was, which
     /// numbers their bases.
     #[serde(default, skip_serializing_if = "is_zero")]
