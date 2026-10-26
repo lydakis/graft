@@ -3,10 +3,16 @@
 //! push is involved, so the copy needs no history and git in it is never asked.
 //!
 //! The commit's tree is the copy's base commit's tree with the copy's changes laid
-//! over it, so it is always the copy's whole state. Its parent is the branch's last
-//! commit when there is one, so each landing adds a commit to the pull request; after
-//! `gft sync` the new base becomes a second parent, so the pull request shows only the
-//! copy's own changes.
+//! over it, so it is always the copy's whole state. Its first parent is the commit
+//! the copy's last landing left the branch at; on a first landing, the landing the
+//! copy was made on top of, if any, else its base. After `gft sync` the new base
+//! becomes a second parent, so the pull request shows only the copy's own changes.
+//!
+//! Each step is recorded as soon as it is done, so a landing cut short (a lost
+//! connection, GitHub refusing the pull request) is finished by landing again. A
+//! branch that moved on GitHub in a way the copy can't account for is left alone:
+//! the copy doesn't have those commits' changes, and landing over them would undo
+//! them.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -16,47 +22,81 @@ use base64::Engine;
 use serde_json::{Value, json};
 
 use crate::github::GitHub;
-use crate::state::{Pr, Store};
-use crate::tools::{Change, changes, git, short};
+use crate::state::{Landing, Pr, Store};
+use crate::tools::{changes, git, short};
 
-pub fn land(
-    store: &Store,
-    repo: &str,
-    name: &str,
-    message: Option<&str>,
-    body: Option<&str>,
-    draft: bool,
-) -> Result<()> {
+pub struct Options<'a> {
+    pub message: Option<&'a str>,
+    pub body: Option<&'a str>,
+    pub draft: bool,
+    /// Land even over commits on the branch that the copy didn't land.
+    pub force: bool,
+}
+
+pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<()> {
     let project = store.load(repo)?;
-    let copy = crate::copy(&project, name)?.clone();
+    let mut copy = crate::copy(&project, name)?.clone();
     crate::mount_copy(&copy)?;
+    let github = GitHub::new(repo)?;
+    // The branch it lands on, and what that branch's pull request is based on: the
+    // branch of the landing it was made on top of, else the default branch.
+    let branch = copy.landed.as_ref().map_or_else(|| format!("graft/{name}"), |landed| landed.branch.clone());
+    let pr_base = copy.stacked.as_ref().map_or(project.branch.clone(), |stacked| stacked.branch.clone());
+    let head = github
+        .get_opt(&format!("git/ref/heads/{branch}"))?
+        .map(|found| found["object"]["sha"].as_str().map(str::to_owned).context("GitHub gave a branch without a sha"))
+        .transpose()?;
+
+    // A landing cut short after its commit was made: if the branch moved to it, it
+    // landed; if the branch is still where it was, it never did, and is made afresh.
+    if let Some(pending) = copy.pending.take() {
+        if head.as_ref() == Some(&pending.commit) {
+            copy.landed = Some(pending);
+        } else if head.as_ref() != copy.landed.as_ref().map(|landed| &landed.commit) {
+            copy.pending = Some(pending);
+        }
+    }
+    // The branch's last commit is this copy's own only when its last landing left it
+    // there. Matching files don't make it so: someone else's branch stays theirs.
+    let ours = copy.landed.as_ref().filter(|landed| head.as_ref() == Some(&landed.commit));
+    if let Some(head) = &head
+        && ours.is_none()
+        && !options.force
+    {
+        let state = match &copy.landed {
+            Some(landed) => {
+                format!("has moved since {name} last landed (from {} to {})", short(&landed.commit), short(head))
+            }
+            None => format!("already exists, at {}, with commits {name} didn't land", short(head)),
+        };
+        bail!(
+            "{branch} on GitHub {state}; landing now would undo what they changed. Take their changes into \
+             {name} first, or land with --force to replace them"
+        );
+    }
+
     let changed = changes(&copy.workspace, None, &copy.dir)?;
-    if changed.is_empty() {
+    // A copy that landed and was then put back as its base has it lands all the
+    // same: its branch should lose those changes too.
+    if changed.is_empty() && ours.is_none() {
         bail!("{name} has no changes to land");
     }
-    let github = GitHub::new(repo)?;
     // The description is kept in step with the one given, and always ends with where
     // the pull request came from.
     let footer = format!("Landed with `gft land` from the copy `{name}`.");
-    let given = body.is_some();
-    let body = match body.map(str::trim).filter(|text| !text.is_empty()) {
+    let given = options.body.is_some();
+    let body = match options.body.map(str::trim).filter(|text| !text.is_empty()) {
         Some(text) => format!("{text}\n\n{footer}"),
         None => footer,
     };
     let describe = |number: u64| github.call("PATCH", &format!("pulls/{number}"), Some(&json!({"body": body})));
 
-    // The branch it lands on, and what that branch's pull request is based on: the
-    // copy it came from, when that one has landed, else the default branch.
-    let branch = copy.pr.as_ref().map_or_else(|| format!("graft/{name}"), |pr| pr.branch.clone());
-    let from_pr = copy.from.as_ref().and_then(|from| project.copies.get(from)).and_then(|from| from.pr.clone());
-    let pr_base = from_pr.as_ref().map_or(project.branch.clone(), |pr| pr.branch.clone());
-
     let base_tree = commit_tree(&github, &copy.base)?;
     let mut entries = Vec::new();
-    let mut landed = BTreeMap::new();
+    let mut files = BTreeMap::new();
     for change in &changed {
         // Before reading the file: if it changes in between, it counts as not landed.
-        landed.insert(change.path.clone(), fingerprint(&copy.dir, change)?);
+        files.insert(change.path.clone(), fingerprint(&copy.dir, &change.path)?);
         entries.push(match change.kind {
             'D' => json!({"path": change.path, "mode": "100644", "type": "blob", "sha": null}),
             _ => {
@@ -71,86 +111,142 @@ pub fn land(
             }
         });
     }
-    let tree = github.call("POST", "git/trees", Some(&json!({"base_tree": base_tree, "tree": entries})))?;
-    let tree = sha(&tree)?;
-
-    let head =
-        github.get_opt(&format!("git/ref/heads/{branch}"))?.map(|r| r["object"]["sha"].as_str().map(str::to_owned));
-    let head = head.flatten();
-    let stacked_on = match (&head, &from_pr) {
-        (None, Some(pr)) => github
-            .get_opt(&format!("git/ref/heads/{}", pr.branch))?
-            .and_then(|r| r["object"]["sha"].as_str().map(str::to_owned)),
-        _ => None,
+    let tree = match entries.is_empty() {
+        true => base_tree,
+        false => sha(&github.call("POST", "git/trees", Some(&json!({"base_tree": base_tree, "tree": entries})))?)?,
     };
-    let mut parents: Vec<String> = head.clone().or(stacked_on).into_iter().collect();
-    if let Some(head) = &head {
-        if commit_tree(&github, head)? == tree {
+    // The branch holds the copy as it is already, as after a landing whose pull
+    // request was never made.
+    let current = match ours {
+        Some(ours) => commit_tree(&github, &ours.commit)? == tree,
+        None => false,
+    };
+    // A branch gone from GitHub (deleted once its pull request was merged or closed)
+    // is made again, with a pull request of its own.
+    let pr = copy.pr.clone().filter(|_| head.is_some());
+
+    let commit = match ours.filter(|_| current) {
+        Some(ours) => {
+            let ours = Landing { files, ..ours.clone() };
+            let commit = ours.commit.clone();
+            record(store, repo, name, |copy| {
+                copy.pending = None;
+                copy.landed = Some(ours);
+                copy.pr = pr.clone();
+            })?;
+            commit
+        }
+        None => {
+            // The first parent, and the base commit it was made on, when known.
+            let (first, first_on) = match (&head, &copy.stacked) {
+                // Over someone else's commits (with --force): made on what it last landed on, if anything.
+                (Some(head), _) => (head.clone(), ours.or(copy.landed.as_ref()).map(|landed| landed.on.clone())),
+                (None, Some(stacked)) => (stacked.commit.clone(), Some(stacked.on.clone())),
+                (None, None) => (copy.base.clone(), Some(copy.base.clone())),
+            };
+            let mut parents = vec![first];
+            // Made on a newer base than that parent: the base joins in.
+            if first_on.as_ref() != Some(&copy.base) {
+                parents.push(copy.base.clone());
+            }
+            let commit_message = match (options.message, &head) {
+                (Some(message), _) => message.to_owned(),
+                (None, None) => format!("Changes from {name}"),
+                (None, Some(_)) => format!("Update {name}"),
+            };
+            let commit = github.call(
+                "POST",
+                "git/commits",
+                Some(&json!({"message": commit_message, "tree": tree, "parents": parents})),
+            )?;
+            let commit = sha(&commit)?;
+            // Recorded before the branch moves, so a landing cut short from here on
+            // can tell its own commit on the branch from someone else's.
+            let landing = Landing { branch: branch.clone(), commit: commit.clone(), on: copy.base.clone(), files };
+            record(store, repo, name, |copy| copy.pending = Some(landing.clone()))?;
+            match head {
+                Some(_) => github.call("PATCH", &format!("git/refs/heads/{branch}"), Some(&json!({"sha": commit})))?,
+                None => github.call(
+                    "POST",
+                    "git/refs",
+                    Some(&json!({"ref": format!("refs/heads/{branch}"), "sha": commit})),
+                )?,
+            };
+            record(store, repo, name, |copy| {
+                copy.pending = None;
+                copy.landed = Some(landing);
+                copy.pr = pr.clone();
+            })?;
+            commit
+        }
+    };
+
+    let pr = match pr {
+        Some(pr) if current => {
             // Only the description is new.
-            if let (true, Some(pr)) = (given, &copy.pr) {
+            if given {
                 describe(pr.number)?;
                 println!("{branch} already has {name} as it is; described it anew: {}", pr.url);
                 return Ok(());
             }
             bail!("nothing new to land: {branch} already has {name} as it is");
         }
-        // Moved onto a newer commit since the last landing: that commit joins in.
-        if copy.pr.as_ref().is_some_and(|pr| pr.landed_on != copy.base) {
-            parents.push(copy.base.clone());
-        }
-    }
-    if parents.is_empty() {
-        parents.push(copy.base.clone());
-    }
-    let title = message.map_or_else(|| name.to_owned(), str::to_owned);
-    let commit_message = match (message, &head) {
-        (Some(message), _) => message.to_owned(),
-        (None, None) => format!("Changes from {name}"),
-        (None, Some(_)) => format!("Update {name}"),
-    };
-    let commit = github.call(
-        "POST",
-        "git/commits",
-        Some(&json!({"message": commit_message, "tree": tree, "parents": parents})),
-    )?;
-    let commit = sha(&commit)?;
-    match head {
-        Some(_) => github.call("PATCH", &format!("git/refs/heads/{branch}"), Some(&json!({"sha": commit})))?,
-        None => {
-            github.call("POST", "git/refs", Some(&json!({"ref": format!("refs/heads/{branch}"), "sha": commit})))?
-        }
-    };
-
-    let pr = match &copy.pr {
         Some(pr) => {
             if given {
                 describe(pr.number)?;
             }
-            Pr { landed_on: copy.base.clone(), landed, ..pr.clone() }
+            pr
         }
-        None => {
-            let made = github.call(
-                "POST",
-                "pulls",
-                Some(&json!({"title": title, "head": branch, "base": pr_base, "body": body, "draft": draft})),
-            )?;
-            Pr {
-                number: made["number"].as_u64().context("GitHub gave no pull request number")?,
-                url: made["html_url"].as_str().unwrap_or_default().to_owned(),
-                branch: branch.clone(),
-                landed_on: copy.base.clone(),
-                landed,
+        // One made by a landing whose answer never came back is found, not made twice.
+        None => match open_pr(&github, repo, &branch)? {
+            Some(pr) => {
+                if given {
+                    describe(pr.number)?;
+                }
+                pr
             }
-        }
+            None => {
+                let title = options.message.map_or_else(|| name.to_owned(), str::to_owned);
+                let made = github.call(
+                    "POST",
+                    "pulls",
+                    Some(&json!({"title": title, "head": branch, "base": pr_base, "body": body,
+                        "draft": options.draft})),
+                )?;
+                as_pr(&made)?
+            }
+        },
     };
     let url = pr.url.clone();
-    store.edit(repo, |project| {
-        let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
-        copy.pr = Some(pr);
-        Ok(())
-    })?;
-    println!("{branch} at {}, {} files: {url}", short(&commit), changed.len());
+    record(store, repo, name, |copy| copy.pr = Some(pr))?;
+    println!("{branch} at {}, {}: {url}", short(&commit), crate::files(changed.len()));
     Ok(())
+}
+
+/// Change the copy `name` as kept on disk.
+fn record(store: &Store, repo: &str, name: &str, change: impl FnOnce(&mut crate::state::Copy)) -> Result<()> {
+    store.edit(repo, |project| {
+        change(project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?);
+        Ok(())
+    })
+}
+
+/// The open pull request from `branch`, if there is one.
+fn open_pr(github: &GitHub, repo: &str, branch: &str) -> Result<Option<Pr>> {
+    let owner = repo.split('/').next().expect("owner/name");
+    let found = github.call("GET", &format!("pulls?head={owner}:{branch}&state=open"), None)?;
+    match found.as_array().map(Vec::as_slice).unwrap_or_default() {
+        [] => Ok(None),
+        [pull] => as_pr(pull).map(Some),
+        _ => bail!("{branch} has more than one open pull request; close all but one and land again"),
+    }
+}
+
+fn as_pr(pull: &Value) -> Result<Pr> {
+    Ok(Pr {
+        number: pull["number"].as_u64().context("GitHub gave no pull request number")?,
+        url: pull["html_url"].as_str().unwrap_or_default().to_owned(),
+    })
 }
 
 /// The id of the tree of `commit`.
@@ -183,24 +279,28 @@ fn mode(path: &Path) -> Result<(&'static str, Option<Vec<u8>>)> {
     Ok((if meta.permissions().mode() & 0o111 != 0 { "100755" } else { "100644" }, None))
 }
 
-/// What a changed file looked like, so `gft rm` can tell whether it is still what
-/// landed. It is the file's own mode and the git hash of its bytes as landing sends
-/// them, without the repository's filters, not its modification time or the
-/// copy's base: `gft sync` rewrites times and moves the base without touching what
-/// the copy changed, and judging by either would call a landed copy unlanded (or,
-/// the other way, miss an edit made inside the same second as the landing). A file
-/// that `gft sync` merged upstream lines into reads as changed, which it is: landing
-/// again would add a commit.
-pub fn fingerprint(dir: &Path, change: &Change) -> Result<String> {
-    if change.kind == 'D' {
-        return Ok("deleted".to_owned());
+/// What the file at `path` in the copy looks like, so `gft rm` can tell whether it is
+/// still what landed: `deleted` when there is no file there, else the file's own mode
+/// and the git hash of its bytes as landing sends them, without the repository's
+/// filters. Not its modification time or the copy's base: `gft sync` rewrites times
+/// and moves the base without touching what the copy changed, and judging by either
+/// would call a landed copy unlanded (or, the other way, miss an edit made inside the
+/// same second as the landing). A file that `gft sync` merged upstream lines into
+/// reads as changed, which it is: landing again would add a commit.
+pub fn fingerprint(dir: &Path, path: &str) -> Result<String> {
+    let full = dir.join(path);
+    match std::fs::symlink_metadata(&full) {
+        Ok(meta) if !meta.is_dir() => {}
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            return Err(err).with_context(|| format!("reading {}", full.display()));
+        }
+        _ => return Ok("deleted".to_owned()),
     }
-    let path = dir.join(&change.path);
-    let (mode, link) = mode(&path)?;
+    let (mode, link) = mode(&full)?;
     let hash = match link {
         // In hex: a link's target is any bytes, and two differing ones must not read the same.
         Some(target) => target.iter().map(|byte| format!("{byte:02x}")).collect(),
-        None => git(dir, &["hash-object", "--no-filters", "--", &change.path])?,
+        None => git(dir, &["hash-object", "--no-filters", "--", path])?,
     };
     Ok(format!("{mode} {hash}"))
 }

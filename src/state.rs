@@ -34,22 +34,46 @@ pub struct Project {
     /// a repository on GitHub.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub folder: bool,
+    /// How many times copies of a plain folder took the folder as it was, which
+    /// numbers their bases.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub takes: u64,
     #[serde(default)]
     pub copies: BTreeMap<String, Copy>,
 }
 
 /// One working copy: a sandfs workspace mounted at `dir`.
+///
+/// Three things say where a copy stands, and each answers one question: `base` is
+/// what its files start from, `stacked` is the landed work it was made on top of,
+/// and `landed` is what it last put on GitHub. Landing builds on all three, so it
+/// never undoes what it doesn't know about.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Copy {
     pub dir: PathBuf,
     pub workspace: String,
-    /// The commit of the default branch the copy sits on; for a copy of a plain
-    /// folder, when the folder was copied, as `SECONDS.NANOS` since the Unix epoch.
+    /// What the copy's files start from, which `gft sync` moves: the commit of the
+    /// default branch it sits on. For a copy of a plain folder, `N@SECONDS`: the
+    /// project's Nth take of the folder as it was, SECONDS after the Unix epoch. Only
+    /// N tells two takes apart; the time is for people.
     pub base: String,
     /// The copy it was made from, if not the default branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
-    /// Its pull request, once landed.
+    /// The landing it was made on top of: when it was made from a copy that had
+    /// landed, that copy's landing as it was then. Its pull request is based on that
+    /// branch, and its first commit follows that landing rather than the branch's
+    /// newest commit, which the copy's files don't have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stacked: Option<Landing>,
+    /// What its last landing put on GitHub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed: Option<Landing>,
+    /// A landing whose commit is made but whose branch may not have moved to it yet,
+    /// kept until it has, so landing again after one cut short knows its own commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<Landing>,
+    /// Its pull request, once made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<Pr>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -59,17 +83,24 @@ pub struct Copy {
     pub next: u64,
 }
 
+/// A copy's changes as a landing left them on GitHub.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Landing {
+    /// The branch on GitHub.
+    pub branch: String,
+    /// The commit the landing left the branch at.
+    pub commit: String,
+    /// The base commit that commit was made on.
+    pub on: String,
+    /// Each file the landing carried, as `fingerprint` saw it, for `gft rm`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pr {
     pub number: u64,
     pub url: String,
-    /// The branch on GitHub that holds the copy's commits.
-    pub branch: String,
-    /// The base commit the last landing was made on.
-    pub landed_on: String,
-    /// Each file the last landing carried, as `fingerprint` saw it, for `gft rm`.
-    #[serde(default)]
-    pub landed: BTreeMap<String, String>,
 }
 
 /// A copy as it was at one moment, kept as an unmounted sandfs workspace.
@@ -80,6 +111,10 @@ pub struct Snapshot {
     pub note: String,
     /// Seconds since the Unix epoch.
     pub time: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Graft's home directory.
