@@ -1,8 +1,8 @@
 # Graft
 
-Work in instant copies of a GitHub repository. Each copy is a [sandfs](https://github.com/lydakis/sandfs) folder over a commit of the default branch, so nothing is cloned, a copy appears in a fraction of a second, and it costs only what it changes. When a copy is good, `gft land` turns it into a branch and a pull request through GitHub's API, with no local commit and no push.
+Work in instant copies of a GitHub repository, or of a plain folder. Each copy is a [sandfs](https://github.com/lydakis/sandfs) folder over a commit of the default branch, so nothing is cloned, a copy appears in a fraction of a second, and it costs only what it changes. When a copy is good, `gft land` turns it into a branch and a pull request through GitHub's API, with no local commit and no push.
 
-The command is `gft` (also installed as `graft`).
+The command is `gft` (also installed as `graft`). For plain folders, see [Plain folders](#plain-folders).
 
 ```bash
 gft get lydakis/sandfs              # ./sandfs: the home copy, tracking main, nothing downloaded up front
@@ -38,7 +38,7 @@ gft rm --force agent-07b            # delete one anyway, losing those changes
 
 | Command | What it does |
 | --- | --- |
-| `gft get OWNER/NAME [DIR] [--github OWNER/NAME]` | Mount the default branch at DIR (default `./NAME`) as the home copy. Takes a repository URL too; for one that isn't github.com's, `--github` says where copies land. |
+| `gft get OWNER/NAME [DIR] [--github OWNER/NAME]` | Mount the default branch at DIR (default `./NAME`) as the home copy. Takes a repository URL too; for one that isn't github.com's, `--github` says where copies land. Given a folder (`./notes`, `/data/survey`), the folder itself is the home copy (see [Plain folders](#plain-folders)). |
 | `gft new NAME... [--from COPY]` | Copies on the newest commit (fetched once for all of them), or on another copy with its changes. They appear next to the home copy as `HOME+NAME`. |
 | `gft ls` | Copies, files changed, the commit each sits on, pull requests, overlaps. Outside a copy, every project's. |
 | `gft status` | In a copy: its name, folder, commit, files changed, snapshots and pull request. In the home copy: the project and how many copies exist. |
@@ -46,7 +46,7 @@ gft rm --force agent-07b            # delete one anyway, losing those changes
 | `gft changes [A] [B] [--count]` | What copy A changed, or how A differs from B. `--count` prints only the totals, like `3 added, 5 modified, 1 deleted`. |
 | `gft save [NOTE]` / `gft undo [N]` | Snapshot the copy; go back N snapshots (default 1). Both take `-c COPY`. |
 | `gft undo --list` | The copy's snapshots, newest first, each with its number for `undo N`, how long ago it was taken and its note. Changes nothing. |
-| `gft sync [NAME]` | Move the copy onto the newest commit. Files changed on both sides are merged line by line with `git merge-file`; conflicts are left marked in the file and listed. |
+| `gft sync [NAME]` | Move the copy onto the newest commit, in place: programs working in the copy carry on. Files changed on both sides are merged line by line with `git merge-file`; conflicts are left marked in the file and listed. |
 | `gft land [NAME] [-m TITLE] [--body TEXT \| --body-file PATH] [--draft]` | Commit the copy's changes on branch `graft/NAME` on GitHub and open a pull request (against the copy it came from, if that one landed). Landing again adds a commit. The description is TEXT or the contents of PATH (`-` reads standard input), followed by a line saying it was landed with `gft land`. Giving one when landing again replaces the description on the open pull request; giving none leaves it as it is. |
 | `gft rm [--force] NAME...` | Delete copies and their snapshots. Pull requests stay. A copy with changes that never landed (no pull request, or files changed since its last landing) is kept, and the files that would be lost are counted, unless `--force` is given. |
 
@@ -76,20 +76,41 @@ gft land add-retries -m "Retry on timeout"             # one pull request per co
 
 - **Check overlaps with `gft ls`.** Each copy's line ends with `overlaps OTHER on FILE` for every other copy that changed a file it also changed. It only sees changes made so far, so an agent runs it before it starts on a shared file and once more before it lands. `gft ls` lists every copy of the repository, so an agent reads its own line. An overlap isn't an error: either the agents split the work differently, or the later one expects to resolve a merge. `gft changes OTHER` lists the files the other copy changed, and `gft changes MINE OTHER` how the two differ.
 - **Stack dependent work with `gft new NAME --from COPY`.** The new copy starts with that copy's changes, so the second agent builds on the first one's work without waiting for it to land. Independent work always starts from main (plain `gft new`), so it never inherits another agent's unfinished work.
-- **Sync when main has moved and you are about to land, or when you need what landed.** Other agents' pull requests move main; a copy stays on the commit it started from until it syncs. Syncing is not needed to keep working, and it unmounts the copy for a moment, so run `gft sync NAME` from another folder of the repository, such as the home copy, with nothing running in the copy (see Limits). Files changed on both sides are merged line by line; any listed as conflicts have `<<<<<<<` markers to fix before you build, test and land.
+- **Sync when main has moved and you are about to land, or when you need what landed.** Other agents' pull requests move main; a copy stays on the commit it started from until it syncs. Syncing is not needed to keep working, and an agent can sync from inside its copy while its programs keep running there. Files changed on both sides are merged line by line; any listed as conflicts have `<<<<<<<` markers to fix before you build, test and land.
 - **Land each copy when it is good.** `gft land -m TITLE` opens `graft/NAME` as a pull request; `--draft` leaves it for review. A stacked copy's pull request is opened against its parent's branch once the parent has landed, so land the parent first and review in that order. Landing again after review comments adds a commit to the same pull request. When the pull requests are merged, `gft rm` the copies.
+
+## Plain folders
+
+A folder that isn't a git repository works the same way, with the folder itself as the home copy and nothing on GitHub:
+
+```bash
+gft get ~/data/survey               # the folder is the home copy; nothing is copied yet
+cd ~/data/survey
+gft new cleanup                     # ~/data/survey+cleanup: the folder as it is now
+cd ../survey+cleanup
+# edit as in any folder; later changes to ~/data/survey stay out of the copy
+gft changes                         # A/M/D against the folder as it was copied
+gft sync                            # take in what the folder has now, keeping the copy's changes
+gft land                            # write the copy's changes into ~/data/survey
+gft rm cleanup
+```
+
+- **A copy is the folder as it was when copied.** Its files are cloned, which costs no space for their contents, but needs the folder and sandfs's home on one disk that clones files: APFS on a Mac, btrfs or XFS on Linux (not ext4).
+- **`land` writes the copy's changes into the folder**: changed and new files, and deletions. If the folder changed one of those files since the copy was made or last synced, nothing is written and the files are named; `gft sync`, then `land` again, writes the copy's version over the folder's. After landing, the copy sits on the folder as it is now, with no changes of its own.
+- **`sync` has nothing to merge from**: a folder keeps no older versions, so a file changed both in the copy and in the folder keeps the copy's version and is listed.
+- `save`, `undo`, `ls`, `changes` and `rm` work as for a repository. `land` takes no `-m`, `--body` or `--draft`.
 
 ## Needs
 
-- A `sandfs` that has `sandfs update` (lydakis/sandfs#156; until it ships in a release, `cargo install --git https://github.com/lydakis/sandfs sandfs-cli`), and what it needs to mount: FUSE 3 on Linux, nothing on macOS.
+- A `sandfs` newer than 0.6.0, which moves a mounted workspace in place (until the next release, `cargo install --git https://github.com/lydakis/sandfs sandfs-cli`), and what it needs to mount: FUSE 3 on Linux, nothing on macOS.
 - `git` and `curl`.
 - A GitHub token for `land`: `GITHUB_TOKEN` or `GH_TOKEN`, else whatever `gh auth token` gives (see [Configuration](#configuration)).
 
 ## Limits
 
-- `sync` unmounts the copy for a moment, so no program may be working inside it then (an agent's shell sitting in the folder counts), and so does `undo` back past a `sync`. Other undos write the snapshot back through the mount and need nothing stopped. Moving a mounted copy in place is planned in sandfs.
+- `undo` back past a `sync` makes the copy again, unmounting it for a moment, so no program may be working inside it then (an agent's shell sitting in the folder counts). So does `rm`. Other undos, and `sync`, change the copy in place and need nothing stopped.
 - Landing uploads each changed file as one API call. A few hundred changed files take a while, and GitHub allows 5,000 calls an hour per token.
-- GitHub only, for now. Plain folders that aren't git repositories are next: there `land` will write the copy's changes back into the folder.
+- Repositories on GitHub (or a stand-in for its API), and plain folders. A folder that is a git repository is taken as a repository: `gft get OWNER/NAME`.
 
 ## Configuration
 
@@ -117,6 +138,7 @@ Graft's notes (copy names, the commit each sits on, pull requests, snapshots) ar
 ```text
 projects/OWNER/NAME.json   the project, its copies and their snapshots
 projects/OWNER/NAME.lock   held while a command changes that file
+projects/folder/NAME.json  a plain folder's project, named after the folder
 ```
 
-The files themselves are sandfs workspaces, kept by sandfs: `NAME` for the home copy, `NAME._main` for the default branch as last fetched (the start of every new copy), `NAME.COPY` for each copy, and `NAME.COPY.N` for its snapshots. Here `NAME` is the repository's name without the owner. A copy's folder sits next to the home copy as `HOME+COPY`. Short-lived files (a request body for `curl`, the pieces of a merge) go in the system's temporary folder and are removed afterwards.
+The files themselves are sandfs workspaces, kept by sandfs: `NAME` for the home copy, `NAME._main` for the default branch as last fetched (the start of every new copy), `NAME.COPY` for each copy, and `NAME.COPY.N` for its snapshots. Here `NAME` is the repository's name without the owner, or the folder's name; a folder has no home or `_main` workspace, since each copy clones the folder as it is. A copy's folder sits next to the home copy as `HOME+COPY`. Short-lived files (a request body for `curl`, the pieces of a merge) go in the system's temporary folder and are removed afterwards.

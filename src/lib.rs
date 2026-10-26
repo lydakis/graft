@@ -1,9 +1,11 @@
-//! Graft (`gft`): work in instant copies of a GitHub repository.
+//! Graft (`gft`): work in instant copies of a GitHub repository, or of a plain folder.
 //!
 //! Every copy is a sandfs folder over a commit of the repository's default branch, so
 //! nothing is cloned and a copy costs what it changes. GitHub stays the place where
 //! history, review and merging live: `gft land` turns a copy's changes into a branch
-//! and a pull request through GitHub's API, without a local commit or a push.
+//! and a pull request through GitHub's API, without a local commit or a push. A copy
+//! of a plain folder is the folder as it was when copied, and lands by writing its
+//! changes back into the folder.
 //!
 //! Graft keeps only names and pointers (see `state`); sandfs keeps the files and git
 //! inside each copy keeps working as in any checkout.
@@ -34,8 +36,12 @@ struct Cli {
 enum Cmd {
     /// Mount a repository's default branch at DIR (default: ./NAME), downloading
     /// nothing up front. This is the home copy, which other copies start from.
+    ///
+    /// Given a plain folder instead (a path such as ./notes or /data/survey), the
+    /// folder itself is the home copy: copies are the folder as it is when made, and
+    /// `land` writes their changes back into it.
     Get {
-        /// OWNER/NAME on GitHub, or the repository's URL.
+        /// OWNER/NAME on GitHub, the repository's URL, or a folder.
         repo: String,
         dir: Option<PathBuf>,
         /// Where copies land, as OWNER/NAME, for a URL that isn't github.com's.
@@ -86,9 +92,13 @@ enum Cmd {
     },
     /// Move a copy onto the newest commit of the default branch, keeping its changes.
     /// Files changed on both sides are merged line by line; conflicts are marked in them.
+    /// A copy of a plain folder moves onto the folder as it is now. Programs working
+    /// in the copy carry on.
     Sync { name: Option<String> },
     /// Land a copy as a pull request: a branch graft/NAME on GitHub with one commit of
-    /// its changes. Landing again adds a commit to the same pull request.
+    /// its changes. Landing again adds a commit to the same pull request. A copy of a
+    /// plain folder lands by writing its changes into the folder, unless a file it
+    /// changed was also changed there since.
     Land {
         name: Option<String>,
         /// The pull request's title, and the commit's message.
@@ -155,6 +165,7 @@ fn run(cli: Cli) -> Result<()> {
                         let copy = copy(&project, &name)?;
                         Ok((copy.workspace.clone(), copy.dir.clone()))
                     }
+                    None if project.folder => bail!("name a copy: the folder itself is what copies change"),
                     None => Ok((project.workspace.clone(), project.home.clone())),
                 }
             };
@@ -189,11 +200,18 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Sync { name } => {
             let (project, current) = here(&store)?;
-            leave_mounts()?;
             sync(&store, &project.repo, &which(name, current)?)
         }
         Cmd::Land { name, message, body, body_file, draft } => {
             let (project, current) = here(&store)?;
+            if project.folder {
+                if message.is_some() || body.is_some() || body_file.is_some() || draft {
+                    bail!(
+                        "a copy of a folder lands into the folder; --message, --body and --draft are for pull requests"
+                    );
+                }
+                return land_folder(&store, &project, &which(name, current)?);
+            }
             let body = match body_file {
                 Some(path) => Some(read_body(&path)?),
                 None => body,
@@ -253,6 +271,18 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
+/// A new base for a copy of a folder: when it was taken, as `SECONDS.NANOS`. The
+/// nanoseconds tell apart bases taken in the same second, since `undo` compares them.
+fn folder_base() -> String {
+    let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    format!("{}.{:09}", time.as_secs(), time.subsec_nanos())
+}
+
+/// When a copy of a folder took its base, in seconds.
+fn copied_at(base: &str) -> Option<u64> {
+    base.split('.').next()?.parse().ok()
+}
+
 /// The workspace that holds the default branch as last fetched, which copies fork.
 fn main_workspace(project: &Project) -> String {
     format!("{}._main", project.workspace)
@@ -302,7 +332,27 @@ fn parse_repo(repo: &str, github: Option<String>) -> Result<(String, String)> {
     Ok((github.unwrap_or(slug), url))
 }
 
+/// `repo` as a folder on this machine, when it is a path (one starting with `/`, `.` or
+/// `~`, or a lone name) to a folder. `OWNER/NAME` always names a repository.
+fn as_folder(repo: &str) -> Option<PathBuf> {
+    let path = match repo.strip_prefix("~/") {
+        Some(rest) => std::env::home_dir()?.join(rest),
+        None => PathBuf::from(repo),
+    };
+    let path_like = repo.starts_with(['/', '.', '~']) || !repo.contains(['/', ':', '@']);
+    (path_like && path.is_dir()).then_some(path)
+}
+
 fn get(store: &Store, repo: &str, dir: Option<PathBuf>, github: Option<String>) -> Result<()> {
+    if let Some(folder) = as_folder(repo) {
+        if dir.is_some() || github.is_some() {
+            bail!("a folder is its own home copy; DIR and --github are for repositories");
+        }
+        return get_folder(store, &folder);
+    }
+    if repo.starts_with(['/', '.', '~']) {
+        bail!("{repo} is no folder");
+    }
     let (slug, source) = parse_repo(repo, github)?;
     let name = slug.rsplit('/').next().expect("owner/name").to_owned();
     let dir = std::path::absolute(dir.unwrap_or_else(|| PathBuf::from(&name)))?;
@@ -317,6 +367,7 @@ fn get(store: &Store, repo: &str, dir: Option<PathBuf>, github: Option<String>) 
         home: dir.clone(),
         workspace: name.clone(),
         branch: String::new(),
+        folder: false,
         copies: BTreeMap::new(),
     };
     // Kept before anything changes the home copy, as the start of every new copy.
@@ -325,6 +376,34 @@ fn get(store: &Store, repo: &str, dir: Option<PathBuf>, github: Option<String>) 
     let commit = git(&dir, &["rev-parse", "HEAD"])?;
     store.create(&project)?;
     println!("{}: {slug} at {} ({})", dir.display(), short(&commit), project.branch);
+    Ok(())
+}
+
+/// Make the plain folder `folder` a project, whose home copy is the folder itself.
+fn get_folder(store: &Store, folder: &Path) -> Result<()> {
+    let folder = folder.canonicalize()?;
+    if folder.join(".git").exists() {
+        bail!(
+            "{} is a git repository; `gft get OWNER/NAME` works on its repository on GitHub instead",
+            folder.display()
+        );
+    }
+    let name = folder.file_name().context("the folder has no name")?.to_string_lossy().into_owned();
+    check_copy_name(&name).with_context(|| format!("{} can't name a project", folder.display()))?;
+    if let Some(other) = store.projects()?.into_iter().find(|project| project.workspace == name) {
+        bail!("{} is already a project named {name}; Graft names a project after its folder", other.home.display());
+    }
+    let project = Project {
+        repo: format!("folder/{name}"),
+        source: path_str(&folder)?.to_owned(),
+        home: folder.clone(),
+        workspace: name,
+        branch: String::new(),
+        folder: true,
+        copies: BTreeMap::new(),
+    };
+    store.create(&project)?;
+    println!("{}: a plain folder; `gft new NAME` makes a copy of it next to it", folder.display());
     Ok(())
 }
 
@@ -344,6 +423,8 @@ fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
             let from = copy(&project, from)?;
             (from.workspace.clone(), Some(from.base.clone()))
         }
+        // Each copy is the folder as it is when made.
+        None if project.folder => (project.source.clone(), None),
         None => {
             // Brings the default branch up to date once for all the copies made now.
             let main = main_workspace(&project);
@@ -359,9 +440,10 @@ fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
         sandfs(&["fork", &source, path_str(&dir)?, "--name", &workspace])?;
         let commit = match &base {
             Some(commit) => commit.clone(),
+            None if project.folder => folder_base(),
             None => git(&dir, &["rev-parse", "HEAD"])?,
         };
-        base = Some(commit.clone());
+        base = base.or_else(|| (!project.folder).then(|| commit.clone()));
         let copy = Copy {
             dir: dir.canonicalize()?,
             workspace,
@@ -396,7 +478,8 @@ fn ls(store: &Store) -> Result<()> {
 }
 
 fn list(project: &Project) -> Result<()> {
-    println!("{}\t{}\t(home, {})", project.workspace, project.home.display(), project.branch);
+    let kind = if project.folder { "folder".to_owned() } else { format!("home, {}", project.branch) };
+    println!("{}\t{}\t({kind})", project.workspace, project.home.display());
     let mut changed: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for (name, copy) in &project.copies {
         let paths = changes(&copy.workspace, None, &copy.dir)?.into_iter().map(|change| change.path).collect();
@@ -417,9 +500,17 @@ fn list(project: &Project) -> Result<()> {
         }
         let pr = copy.pr.as_ref().map_or("-".to_owned(), |pr| pr.url.clone());
         let files = files(mine.len());
-        println!("{name}\t{files}\tbase {}\t{pr}\t{}", short(&copy.base), notes.join("; "));
+        println!("{name}\t{files}\t{}\t{pr}\t{}", based(project, &copy.base), notes.join("; "));
     }
     Ok(())
+}
+
+/// What a copy sits on: `base COMMIT`, or for a copy of a folder `copied … ago`.
+fn based(project: &Project, base: &str) -> String {
+    match copied_at(base) {
+        Some(time) if project.folder => format!("copied {}", ago(now().saturating_sub(time))),
+        _ => format!("base {}", short(base)),
+    }
 }
 
 fn files(n: usize) -> String {
@@ -456,7 +547,10 @@ fn status(store: &Store) -> Result<()> {
     let files = changes(&copy.workspace, None, &copy.dir)?.len();
     println!("copy       {name}");
     println!("folder     {}", copy.dir.display());
-    println!("on commit  {}", short(&copy.base));
+    match project.folder {
+        true => println!("copied     {}", ago(now().saturating_sub(copied_at(&copy.base).unwrap_or(0)))),
+        false => println!("on commit  {}", short(&copy.base)),
+    }
     println!("changed    {files} {}", if files == 1 { "file" } else { "files" });
     println!("snapshots  {}", copy.snapshots.len());
     if let Some(pr) = &copy.pr {
@@ -557,14 +651,13 @@ fn sync(store: &Store, repo: &str, name: &str) -> Result<()> {
     save(store, repo, name, "before sync")?;
     let project = store.load(repo)?;
     let copy = copy(&project, name)?.clone();
-    if mounted(&copy.workspace)?.is_some() {
-        in_use(&copy, sandfs(&["unmount", &copy.workspace]))?;
-    }
-    let moved = sandfs(&["update", &copy.workspace]);
-    // Mounted again whatever happened, so a refused update leaves the copy as it was.
-    sandfs(&["mount", &copy.workspace, path_str(&copy.dir)?])?;
-    let (out, _) = moved?;
-    let new = git(&copy.dir, &["rev-parse", "HEAD"])?;
+    mount_copy(&copy)?;
+    // Moved in place, so programs working in the copy carry on.
+    let (out, _) = sandfs(&["update", &copy.workspace])?;
+    let new = match project.folder {
+        true => folder_base(),
+        false => git(&copy.dir, &["rev-parse", "HEAD"])?,
+    };
     store.edit(repo, |project| {
         let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
         copy.base = new.clone();
@@ -573,18 +666,42 @@ fn sync(store: &Store, repo: &str, name: &str) -> Result<()> {
     let both: Vec<&str> = out.lines().filter_map(|line| line.strip_prefix("C ")).collect();
     let mut conflicts = 0;
     for path in &both {
-        let outcome = merge(&copy.dir, &copy.base, &new, path)?;
+        // A folder keeps no older version to merge from.
+        let outcome = match project.folder {
+            true => "changed in the folder too; kept yours",
+            false => merge(&copy.dir, &copy.base, &new, path)?,
+        };
         if outcome != "merged" {
             conflicts += 1;
         }
         println!("{outcome}\t{path}");
     }
-    println!(
-        "{name} moved from {} to {}; {} files changed on both sides, {conflicts} need a look",
-        short(&copy.base),
-        short(&new),
-        both.len()
-    );
+    let moved = match project.folder {
+        true => format!("{name} now has {} as it is", project.home.display()),
+        false => format!("{name} moved from {} to {}", short(&copy.base), short(&new)),
+    };
+    println!("{moved}; {} files changed on both sides, {conflicts} need a look", both.len());
+    Ok(())
+}
+
+/// Write a copy's changes into the plain folder it is a copy of, refusing them all if
+/// a file it changed was also changed there since, then move the copy onto the folder
+/// as it is now, where its changes are the folder's own and no longer the copy's.
+fn land_folder(store: &Store, project: &Project, name: &str) -> Result<()> {
+    let copy = copy(project, name)?.clone();
+    mount_copy(&copy)?;
+    let changed = changes(&copy.workspace, None, &copy.dir)?;
+    if changed.is_empty() {
+        bail!("{name} has no changes to land");
+    }
+    sandfs(&["changes", &copy.workspace, "--copy-to", path_str(&project.home)?])?;
+    sandfs(&["update", &copy.workspace])?;
+    store.edit(&project.repo, |project| {
+        let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
+        copy.base = folder_base();
+        Ok(())
+    })?;
+    println!("{name}: {} written to {}", files(changed.len()), project.home.display());
     Ok(())
 }
 
@@ -652,6 +769,14 @@ fn mount_copy(copy: &Copy) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_bases_taken_in_one_second_differ() {
+        let (a, b) = (folder_base(), folder_base());
+        assert_ne!(a, b);
+        assert!(now() - copied_at(&a).unwrap() <= 1);
+        assert_eq!(copied_at("1700000000"), Some(1_700_000_000));
+    }
 
     #[test]
     fn times_are_told_in_the_largest_unit() {

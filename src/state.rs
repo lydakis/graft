@@ -16,19 +16,24 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// A repository Graft works on, with its copies.
+/// A repository or a plain folder Graft works on, with its copies.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
-    /// `owner/name` on GitHub, where copies land.
+    /// `owner/name` on GitHub, where copies land; `folder/name` for a plain folder.
     pub repo: String,
-    /// What sandfs mounts: the repository's URL.
+    /// What sandfs mounts: the repository's URL, or the folder.
     pub source: String,
-    /// The home copy's folder, which tracks the default branch.
+    /// The home copy's folder, which tracks the default branch; for a plain folder,
+    /// the folder itself.
     pub home: PathBuf,
-    /// The sandfs workspace of the home copy.
+    /// The sandfs workspace of the home copy, and the start of its copies' names.
     pub workspace: String,
-    /// The default branch, which copies land onto.
+    /// The default branch, which copies land onto; empty for a plain folder.
     pub branch: String,
+    /// Whether the project is a plain folder, which copies land back into, rather than
+    /// a repository on GitHub.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub folder: bool,
     #[serde(default)]
     pub copies: BTreeMap<String, Copy>,
 }
@@ -38,7 +43,8 @@ pub struct Project {
 pub struct Copy {
     pub dir: PathBuf,
     pub workspace: String,
-    /// The commit of the default branch the copy sits on.
+    /// The commit of the default branch the copy sits on; for a copy of a plain
+    /// folder, when the folder was copied, as `SECONDS.NANOS` since the Unix epoch.
     pub base: String,
     /// The copy it was made from, if not the default branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,16 +164,24 @@ impl Store {
     /// The project whose home copy or one of whose copies holds `dir`, and that copy.
     pub fn find(&self, dir: &Path) -> Result<(Project, Option<String>)> {
         let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        // The deepest folder that holds `dir` wins, since a folder project may sit
+        // inside another one.
+        let mut found: Option<(usize, Project, Option<String>)> = None;
         for project in self.projects()? {
-            for (name, copy) in &project.copies {
-                if dir.starts_with(&copy.dir) {
-                    let name = name.clone();
-                    return Ok((project, Some(name)));
-                }
+            let homes = project.copies.iter().map(|(name, copy)| (&copy.dir, Some(name.clone())));
+            let best = homes
+                .chain([(&project.home, None)])
+                .filter(|(home, _)| dir.starts_with(home))
+                .map(|(home, name)| (home.components().count(), name))
+                .max_by_key(|(depth, _)| *depth);
+            if let Some((depth, name)) = best
+                && found.as_ref().is_none_or(|(deepest, ..)| depth > *deepest)
+            {
+                found = Some((depth, project, name));
             }
-            if dir.starts_with(&project.home) {
-                return Ok((project, None));
-            }
+        }
+        if let Some((_, project, name)) = found {
+            return Ok((project, name));
         }
         bail!("{} is in no Graft copy; start with `gft get OWNER/REPO`", dir.display())
     }
