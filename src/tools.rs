@@ -58,7 +58,10 @@ pub fn changes(name: &str, since: Option<&str>, dir: &Path) -> Result<Vec<Change
             _ => bail!("unexpected line from sandfs changes: {line:?}"),
         })
         .collect::<Result<Vec<_>>>()?;
-    let ignored = ignored(dir, all.iter().map(|change| change.path.as_str()))?;
+    // Only an added file can be one git ignores; the others are files of the base, which
+    // git tracks, and a deleted one may sit below a link that replaced its folder, which
+    // git refuses to look past.
+    let ignored = ignored(dir, all.iter().filter(|change| change.kind == 'A').map(|change| change.path.as_str()))?;
     Ok(all.into_iter().filter(|change| !ignored.contains(&change.path)).collect())
 }
 

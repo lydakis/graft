@@ -345,6 +345,14 @@ fn copies_are_made_compared_synced_and_landed() {
     assert!(!both.status.success());
     let unchanged = gft.try_run(&fix, &["land"]);
     assert!(String::from_utf8_lossy(&unchanged.stderr).contains("nothing new to land"));
+    // With nothing new but a description, only the description changes.
+    let redescribed = gft.run(&fix, &["land", "--body", "Only words."]);
+    assert!(redescribed.contains("described it anew"), "{redescribed}");
+    {
+        let made = made.lock().unwrap();
+        assert_eq!(made.patches[2], (1, json!("Only words.\n\nLanded with `gft land` from the copy `fix`.")));
+        assert_eq!(made.refs["heads/graft/fix"], "commit-4", "no new commit");
+    }
 
     // A copy of a copy starts with its changes and lands on top of its branch.
     gft.run(&home, &["new", "more", "--from", "fix"]);

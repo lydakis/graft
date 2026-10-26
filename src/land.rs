@@ -34,8 +34,16 @@ pub fn land(
     if changed.is_empty() {
         bail!("{name} has no changes to land");
     }
-    let given = body.is_some();
     let github = GitHub::new(repo)?;
+    // The description is kept in step with the one given, and always ends with where
+    // the pull request came from.
+    let footer = format!("Landed with `gft land` from the copy `{name}`.");
+    let given = body.is_some();
+    let body = match body.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) => format!("{text}\n\n{footer}"),
+        None => footer,
+    };
+    let describe = |number: u64| github.call("PATCH", &format!("pulls/{number}"), Some(&json!({"body": body})));
 
     // The branch it lands on, and what that branch's pull request is based on: the
     // copy it came from, when that one has landed, else the default branch.
@@ -78,6 +86,12 @@ pub fn land(
     let mut parents: Vec<String> = head.clone().or(stacked_on).into_iter().collect();
     if let Some(head) = &head {
         if commit_tree(&github, head)? == tree {
+            // Only the description is new.
+            if let (true, Some(pr)) = (given, &copy.pr) {
+                describe(pr.number)?;
+                println!("{branch} already has {name} as it is; described it anew: {}", pr.url);
+                return Ok(());
+            }
             bail!("nothing new to land: {branch} already has {name} as it is");
         }
         // Moved onto a newer commit since the last landing: that commit joins in.
@@ -107,17 +121,10 @@ pub fn land(
         }
     };
 
-    // The description is kept in step with the one given, and always ends with where
-    // the pull request came from.
-    let footer = format!("Landed with `gft land` from the copy `{name}`.");
-    let body = match body.map(str::trim).filter(|text| !text.is_empty()) {
-        Some(text) => format!("{text}\n\n{footer}"),
-        None => footer,
-    };
     let pr = match &copy.pr {
         Some(pr) => {
             if given {
-                github.call("PATCH", &format!("pulls/{}", pr.number), Some(&json!({"body": body})))?;
+                describe(pr.number)?;
             }
             Pr { landed_on: copy.base.clone(), landed, ..pr.clone() }
         }
@@ -191,7 +198,8 @@ pub fn fingerprint(dir: &Path, change: &Change) -> Result<String> {
     let path = dir.join(&change.path);
     let (mode, link) = mode(&path)?;
     let hash = match link {
-        Some(target) => String::from_utf8_lossy(&target).into_owned(),
+        // In hex: a link's target is any bytes, and two differing ones must not read the same.
+        Some(target) => target.iter().map(|byte| format!("{byte:02x}")).collect(),
         None => git(dir, &["hash-object", "--no-filters", "--", &change.path])?,
     };
     Ok(format!("{mode} {hash}"))
