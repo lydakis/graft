@@ -77,6 +77,7 @@ fn file_in(made: &Made, tree: &str, path: &str) -> Option<Vec<u8>> {
     }
     let body = made.tree_ids.get(tree)?;
     match body["tree"].as_array()?.iter().find(|entry| entry["path"] == path) {
+        Some(entry) if entry["content"].is_string() => Some(entry["content"].as_str()?.as_bytes().to_vec()),
         Some(entry) => made.blob_ids.get(entry["sha"].as_str()?).cloned(),
         None => file_in(made, body["base_tree"].as_str()?, path),
     }
@@ -220,6 +221,10 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
                         (200, json!({}))
                     }
                 }
+                ("DELETE", p) if p.starts_with("git/refs/") => match made.refs.remove(&p["git/refs/".len()..]) {
+                    Some(_) => (204, Value::Null),
+                    None => (422, json!({"message": "Reference does not exist"})),
+                },
                 ("GET", p) if p.starts_with("pulls?head=o:") => {
                     let mut query = p["pulls?head=o:".len()..].split('&');
                     let branch = query.next().unwrap();
@@ -424,7 +429,7 @@ fn copies_are_made_compared_synced_and_landed() {
     let status = gft.run(&fix, &["status"]);
     assert!(status.contains("copy       fix\n") && status.contains("changed    2 files\n"), "{status}");
     assert!(status.contains("snapshots  1\n") && !status.contains("pull request"), "{status}");
-    assert_eq!(gft.run(&home, &["status"]).lines().last(), Some("copies   2"));
+    assert!(gft.run(&home, &["status"]).contains("copies   2\n"));
     std::fs::remove_file(fix.join("notes.txt")).unwrap();
     std::fs::write(fix.join("stray.txt"), "oops\n").unwrap();
     // From inside the copy, with a program working there all along.
@@ -605,18 +610,21 @@ fn copies_of_a_plain_folder_land_back_into_it() {
     shell.wait().unwrap();
     gft.run(&folder, &["rm", "edit"]);
 
-    // A copy that changed a file the folder has changed since lands nothing.
-    std::fs::write(other.join("todo.md"), "- a\n- c\n").unwrap();
+    // A copy that changed a file the folder has changed since lands nothing, and
+    // says how to go on in Graft's terms.
+    std::fs::write(other.join("todo.md"), "- z\n- a\n").unwrap();
     std::fs::write(other.join("new.md"), "new\n").unwrap();
     let clash = gft.try_run(&other, &["land"]);
     assert!(!clash.status.success());
-    assert!(String::from_utf8_lossy(&clash.stderr).contains("todo.md"), "{}", String::from_utf8_lossy(&clash.stderr));
+    let said = String::from_utf8_lossy(&clash.stderr);
+    assert!(said.contains("todo.md") && said.contains("`gft sync other`") && !said.contains("--force"), "{said}");
     assert!(!folder.join("new.md").exists(), "nothing was written");
-    // After a sync it is a change on both sides, kept as the copy has it.
+    // A sync merges the folder's change in, from the folder as the copy took it, so
+    // landing keeps both.
     let synced = gft.run(&other, &["sync"]);
-    assert!(synced.contains("kept yours\ttodo.md") && synced.contains("1 need a look"), "{synced}");
+    assert!(synced.contains("merged\ttodo.md") && synced.contains("0 need a look"), "{synced}");
     gft.run(&other, &["land"]);
-    assert_eq!(std::fs::read_to_string(folder.join("todo.md")).unwrap(), "- a\n- c\n");
+    assert_eq!(std::fs::read_to_string(folder.join("todo.md")).unwrap(), "- z\n- a\n- b\n");
     assert_eq!(std::fs::read_to_string(folder.join("new.md")).unwrap(), "new\n");
     gft.run(&folder, &["rm", "other"]);
     assert!(!gft.run(&folder, &["ls"]).contains("other"));
@@ -978,8 +986,17 @@ fn closed_and_merged_pull_requests_take_no_more_commits() {
     assert_eq!(gft.run(&at("merged"), &["changes"]), "M merged.txt\n");
     let landed = gft.run(&at("merged"), &["land"]);
     assert!(landed.contains("graft/merged-2 at ") && landed.contains("pull/4"), "{landed}");
+    assert_eq!(made.lock().unwrap().commits.last().unwrap()["parents"], json!([merge]));
+
+    // `rm --delete-branch` deletes a branch whose pull request is done with, and
+    // keeps one still open.
+    made.lock().unwrap().pulls[2]["state"] = json!("closed");
+    let removed = gft.run(&home, &["rm", "--delete-branch", "closed", "merged"]);
+    assert!(removed.contains("closed: deleted branch graft/closed-2"), "{removed}");
+    assert!(removed.contains("merged: kept branch graft/merged-2: pull request #4 is still open"), "{removed}");
     let made = made.lock().unwrap();
-    assert_eq!(made.commits.last().unwrap()["parents"], json!([merge]));
+    assert!(!made.refs.contains_key("heads/graft/closed-2"));
+    assert!(made.refs.contains_key("heads/graft/merged-2"));
 }
 
 #[test]
@@ -1166,5 +1183,93 @@ fn many_new_copies_at_once_and_dropping_the_project() {
     assert!(!work.join("app+c1").exists(), "copy left");
     assert!(String::from_utf8_lossy(&gft.try_run(&work, &["ls"]).stderr).contains("start with `gft get"));
     // And it can start over.
-    gft.run(&work, &["get", &format!("file://{}", upstream.path().display()), "app", "--github", "o/n"]);
+    let url = format!("file://{}", upstream.path().display());
+    gft.run(&work, &["get", &url, "app", "--github", "o/n"]);
+    let again = gft.try_run(&work, &["get", &url, "again", "--github", "o/n"]);
+    assert!(String::from_utf8_lossy(&again.stderr).contains("o/n is a project already, at"));
+    // Another owner's repository of the same name sits beside it.
+    gft.run(&work, &["get", &url, "fork", "--github", "p/n"]);
+    gft.run(&work.join("fork"), &["new", "x"]);
+    assert!(work.join("fork+x/README.md").exists());
+    gft.run(&work, &["drop", "fork"]);
+    assert!(!work.join("fork+x").exists(), "fork's copy left");
+    assert!(work.join("app/README.md").exists(), "o/n went too");
+}
+
+#[test]
+fn copies_come_back_and_follow_upstream() {
+    if !mounts() {
+        return;
+    }
+    let (upstream, work, gft, made) = project();
+    let repo = upstream.path();
+    let work = work.path().canonicalize().unwrap();
+    let home = work.join("app");
+    let at = |name: &str| work.join(format!("app+{name}"));
+    gft.run(&home, &["new", "a", "b"]);
+
+    // Unmounted, as after a restart: `ls` says so, a command in the copy mounts it
+    // again, and `up` mounts the rest.
+    let sandfs = sandfs::Home::at(gft.sandfs_home.path()).unwrap();
+    sandfs.unmount("n.a").unwrap();
+    sandfs.unmount("n.b").unwrap();
+    assert!(gft.run(&home, &["ls"]).contains("not mounted: `gft up` brings it back"));
+    let status = gft.try_run(&at("a"), &["status"]);
+    assert!(String::from_utf8_lossy(&status.stderr).contains("mounted a again"));
+    assert!(at("a").join("README.md").exists());
+    assert!(gft.run(&home, &["up"]).contains("mounted b at "));
+    assert_eq!(gft.run(&home, &["up"]), "all mounted\n");
+
+    // Commits made in a copy are set aside on sync; their changes stay.
+    std::fs::write(at("a").join("notes.txt"), "noted\n").unwrap();
+    git(&at("a"), &["add", "-A"]);
+    git(&at("a"), &["commit", "-q", "-m", "local"]);
+    // Upstream renames a file the copy changed: the change follows it.
+    std::fs::write(at("a").join("README.md"), "one\ntwo\nthree, edited\n").unwrap();
+    std::fs::write(repo.join("README.md"), "zero\none\ntwo\nthree\n").unwrap();
+    git(repo, &["mv", "README.md", "GUIDE.md"]);
+    git(repo, &["commit", "-qam", "rename"]);
+    let synced = gft.run(&at("a"), &["sync"]);
+    assert!(synced.contains("set aside 1 commit made in the copy"), "{synced}");
+    assert!(synced.contains("renamed upstream to GUIDE.md; merged there\tREADME.md"), "{synced}");
+    assert!(!at("a").join("README.md").exists());
+    assert_eq!(std::fs::read_to_string(at("a").join("GUIDE.md")).unwrap(), "zero\none\ntwo\nthree, edited\n");
+    assert_eq!(gft.run(&at("a"), &["changes"]), "M GUIDE.md\nA notes.txt\n");
+    let listed: Value = serde_json::from_str(&gft.run(&at("a"), &["changes", "--json"])).unwrap();
+    assert_eq!(listed, json!([{"kind": "M", "path": "GUIDE.md"}, {"kind": "A", "path": "notes.txt"}]));
+
+    // `diff` shows what landing sends, added files included; between copies, from
+    // the first to the second.
+    let diff = gft.run(&at("a"), &["diff"]);
+    assert!(diff.contains("+three, edited") && diff.contains("+++ b/notes.txt"), "{diff}");
+    let between = gft.run(&home, &["diff", "b", "a"]);
+    assert!(between.contains("+noted") && between.contains("app+a/GUIDE.md"), "{between}");
+
+    // Text lands inside the tree, with no call per file.
+    gft.run(&at("a"), &["land"]);
+    {
+        let made = made.lock().unwrap();
+        assert!(made.blobs.is_empty());
+        assert_eq!(made.trees[0]["tree"][1]["content"], "noted\n");
+    }
+
+    // A copy made from another has its files: no overlap until one changes them.
+    gft.run(&home, &["new", "c", "--from", "a"]);
+    let listed: Value = serde_json::from_str(&gft.run(&home, &["ls", "--json"])).unwrap();
+    let copies = listed[0]["copies"].as_array().unwrap();
+    let c = copies.iter().find(|copy| copy["name"] == "c").unwrap();
+    assert_eq!(c["overlaps"], json!({}), "{listed}");
+    std::fs::write(at("c").join("notes.txt"), "noted differently\n").unwrap();
+    assert!(gft.run(&home, &["ls"]).contains("overlaps a on notes.txt"));
+
+    // Work done in the home copy shows, can be copied, and the home syncs too.
+    std::fs::write(home.join("home.txt"), "made at home\n").unwrap();
+    let status = gft.run(&home, &["status"]);
+    assert!(status.contains("changed    1 file here, which new copies don't have"), "{status}");
+    gft.run(&home, &["new", "h", "--from", "app"]);
+    assert_eq!(std::fs::read_to_string(at("h").join("home.txt")).unwrap(), "made at home\n");
+    let newest = commit_upstream(repo, "later.txt", "later\n");
+    assert!(gft.run(&home, &["sync"]).contains("app moved from"));
+    assert_eq!(git(&home, &["rev-parse", "HEAD"]), newest);
+    assert!(home.join("later.txt").exists() && home.join("home.txt").exists());
 }
