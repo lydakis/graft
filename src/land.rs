@@ -81,6 +81,16 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
         if open && !options.new_pr {
             open_base = pull["base"]["ref"].as_str().map(str::to_owned);
         } else {
+            if merged && pull["base"]["ref"] != project.branch.as_str() {
+                let into = pull["base"]["ref"].as_str().unwrap_or("another branch");
+                bail!(
+                    "pull request #{} was merged into {into}, not {}: once {into} is merged, `gft sync {name}` \
+                     moves {name} onto {} with both, and it lands again as a new pull request",
+                    pr.number,
+                    project.branch,
+                    project.branch
+                );
+            }
             if merged {
                 let merge = pull["merge_commit_sha"].as_str().unwrap_or_default();
                 if !merge.is_empty() && !contains(&github, &copy.base, merge)? {
@@ -137,7 +147,8 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
     }
     // A first landing onto a branch that exists already, left by an earlier copy of
     // the same name or by anyone else, takes a name of its own instead of their history.
-    if copy.landed.is_none() && head.is_some() && !options.force {
+    // `--new-pr` always does, `--force` or not: the earlier pull request stays as it is.
+    if copy.landed.is_none() && head.is_some() && (!options.force || options.new_pr) {
         copy.pending = None;
         let mut n = 2;
         while head.is_some() {

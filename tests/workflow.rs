@@ -957,7 +957,7 @@ fn closed_and_merged_pull_requests_take_no_more_commits() {
     let refused = gft.try_run(&at("closed"), &["land"]);
     assert!(String::from_utf8_lossy(&refused.stderr).contains("#1 was closed without being merged"));
     assert_eq!(made.lock().unwrap().refs["heads/graft/closed"], "commit-1");
-    let landed = gft.run(&at("closed"), &["land", "--new-pr"]);
+    let landed = gft.run(&at("closed"), &["land", "--new-pr", "--force"]);
     assert!(landed.contains("graft/closed-2 at ") && landed.contains("pull/3"), "{landed}");
 
     // Merged: what lands next needs to go on top of it, after a sync.
@@ -1048,6 +1048,26 @@ fn copies_built_on_merged_work_move_onto_main_with_it() {
     std::fs::write(work.join("app+top/top.txt"), "y\nz\n").unwrap();
     gft.run(&work.join("app+top"), &["land"]);
     assert_eq!(made.lock().unwrap().retargets, [(5, "main".to_owned())]);
+
+    // Merged into the branch it was built on, which is still open: the copy stays
+    // on that branch until it merges.
+    gft.run(&home, &["new", "base3"]);
+    std::fs::write(work.join("app+base3/three.txt"), "x\n").unwrap();
+    gft.run(&work.join("app+base3"), &["land"]);
+    gft.run(&home, &["new", "mid", "--on", "base3"]);
+    std::fs::write(work.join("app+mid/mid.txt"), "y\n").unwrap();
+    gft.run(&work.join("app+mid"), &["land"]);
+    {
+        let mut made = made.lock().unwrap();
+        assert_eq!(made.pulls[6]["base"], "graft/base3");
+        made.pulls[6]["state"] = json!("closed");
+        made.pulls[6]["merged_at"] = json!("2026-10-26T00:00:00Z");
+    }
+    commit_upstream(repo, "elsewhere.txt", "z\n");
+    let synced = gft.run(&work.join("app+mid"), &["sync"]);
+    assert!(!synced.contains("new one") && !synced.contains("builds on main"), "{synced}");
+    let refused = gft.try_run(&work.join("app+mid"), &["land"]);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("#7 was merged into graft/base3, not main"));
 }
 
 #[test]

@@ -970,8 +970,11 @@ fn merged(project: &Project, copy: &Copy, name: &str) -> Result<Option<Merged>> 
         Some(pr) => Some((pr.number, github.call("GET", &format!("pulls/{}", pr.number), None)?)),
         None => None,
     };
+    // Merged into the default branch, that is: one merged into the branch of the
+    // copy it was built on is in the default branch only once that one is.
     if let (Some((number, pull)), Some(landed)) = (&pull, &copy.landed)
         && pull["merged_at"].is_string()
+        && pull["base"]["ref"] == project.branch.as_str()
         && !landed.commit.is_empty()
     {
         let said = format!("pull request #{number} was merged; {name} lands next as a new one");
