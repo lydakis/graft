@@ -16,19 +16,24 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// A repository Graft works on, with its copies.
+/// A repository or a plain folder Graft works on, with its copies.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
-    /// `owner/name` on GitHub, where copies land.
+    /// `owner/name` on GitHub, where copies land; `folder/name` for a plain folder.
     pub repo: String,
-    /// What sandfs mounts: the repository's URL.
+    /// What sandfs mounts: the repository's URL, or the folder.
     pub source: String,
-    /// The home copy's folder, which tracks the default branch.
+    /// The home copy's folder, which tracks the default branch; for a plain folder,
+    /// the folder itself.
     pub home: PathBuf,
-    /// The sandfs workspace of the home copy.
+    /// The sandfs workspace of the home copy, and the start of its copies' names.
     pub workspace: String,
-    /// The default branch, which copies land onto.
+    /// The default branch, which copies land onto; empty for a plain folder.
     pub branch: String,
+    /// Whether the project is a plain folder, which copies land back into, rather than
+    /// a repository on GitHub.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub folder: bool,
     #[serde(default)]
     pub copies: BTreeMap<String, Copy>,
 }
@@ -38,7 +43,8 @@ pub struct Project {
 pub struct Copy {
     pub dir: PathBuf,
     pub workspace: String,
-    /// The commit of the default branch the copy sits on.
+    /// The commit of the default branch the copy sits on; for a copy of a plain
+    /// folder, when the folder was copied, in seconds since the Unix epoch.
     pub base: String,
     /// The copy it was made from, if not the default branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]

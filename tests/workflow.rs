@@ -305,8 +305,13 @@ fn copies_are_made_compared_synced_and_landed() {
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "-q", "-m", "second"]);
     let second = git(repo, &["rev-parse", "HEAD"]);
+    // From inside the copy, with a program working in one of its folders.
+    let mut shell = Command::new("sleep").arg("30").current_dir(fix.join("src")).spawn().unwrap();
     let synced = gft.run(&fix, &["sync"]);
     assert!(synced.contains("merged\tsrc/lib.rs"), "{synced}");
+    assert!(shell.try_wait().unwrap().is_none());
+    shell.kill().unwrap();
+    shell.wait().unwrap();
     assert_eq!(std::fs::read_to_string(fix.join("src/lib.rs")).unwrap(), "// lib\nfn one() {}\n\nfn two() { 2 }\n");
     assert_eq!(std::fs::read_to_string(fix.join("CHANGES.md")).unwrap(), "- one\n");
     assert_eq!(gft.run(&fix, &["changes"]), "A notes.txt\nM src/lib.rs\n");
@@ -401,4 +406,74 @@ fn copies_are_made_compared_synced_and_landed() {
     gft.run(&home, &["rm", "fix"]);
     gft.run(&home, &["rm", "--force", "try", "more"]);
     assert!(!gft.run(&home, &["ls"]).contains("try"));
+}
+
+#[test]
+fn copies_of_a_plain_folder_land_back_into_it() {
+    if !sandfs_available() {
+        return;
+    }
+    let (api, _) = fake_github();
+    let gft = Gft { sandfs_home: tempfile::tempdir().unwrap(), graft_home: tempfile::tempdir().unwrap(), api };
+    let work = tempfile::tempdir().unwrap();
+    let work = work.path().canonicalize().unwrap();
+    let folder = work.join("notes");
+    std::fs::create_dir_all(folder.join("drafts")).unwrap();
+    std::fs::write(folder.join("todo.md"), "- a\n").unwrap();
+    std::fs::write(folder.join("drafts/one.md"), "one\n").unwrap();
+
+    let got = gft.run(&work, &["get", "./notes"]);
+    assert!(got.contains("a plain folder"), "{got}");
+    assert!(gft.run(&work, &["ls"]).contains("notes\t") && gft.run(&work, &["ls"]).contains("(folder)"));
+    // A copy is the folder as it is when made, which needs a disk that clones files.
+    let made = gft.try_run(&folder, &["new", "edit", "other"]);
+    if String::from_utf8_lossy(&made.stderr).contains("clones files") {
+        eprintln!("skipping: this disk doesn't clone files (try TMPDIR on APFS, btrfs or XFS)");
+        return;
+    }
+    assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+    let (edit, other) = (work.join("notes+edit"), work.join("notes+other"));
+    std::fs::write(folder.join("later.md"), "made in the folder later\n").unwrap();
+    assert!(!edit.join("later.md").exists(), "the folder's later changes stay out");
+    std::fs::write(edit.join("todo.md"), "- a\n- b\n").unwrap();
+    std::fs::remove_file(edit.join("drafts/one.md")).unwrap();
+    assert_eq!(gft.run(&edit, &["changes"]), "D drafts/one.md\nM todo.md\n");
+    assert!(gft.run(&edit, &["status"]).contains("copied     "));
+    let refused = gft.try_run(&edit, &["land", "-m", "a title"]);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("are for pull requests"));
+    assert!(String::from_utf8_lossy(&gft.try_run(&folder, &["changes"]).stderr).contains("name a copy"));
+
+    // Synced from inside, with a program working there: the copy takes in what the
+    // folder has now and keeps its own changes.
+    let mut shell = Command::new("sleep").arg("30").current_dir(edit.join("drafts")).spawn().unwrap();
+    let synced = gft.run(&edit, &["sync"]);
+    assert!(synced.contains("0 files changed on both sides"), "{synced}");
+    assert_eq!(std::fs::read_to_string(edit.join("later.md")).unwrap(), "made in the folder later\n");
+    assert_eq!(gft.run(&edit, &["changes"]), "D drafts/one.md\nM todo.md\n");
+
+    // Landing writes the changes into the folder; then they are the folder's own.
+    let landed = gft.run(&edit, &["land"]);
+    assert!(landed.contains("2 files written to"), "{landed}");
+    assert_eq!(std::fs::read_to_string(folder.join("todo.md")).unwrap(), "- a\n- b\n");
+    assert!(!folder.join("drafts/one.md").exists());
+    assert_eq!(gft.run(&edit, &["changes"]), "");
+    shell.kill().unwrap();
+    shell.wait().unwrap();
+    gft.run(&folder, &["rm", "edit"]);
+
+    // A copy that changed a file the folder has changed since lands nothing.
+    std::fs::write(other.join("todo.md"), "- a\n- c\n").unwrap();
+    std::fs::write(other.join("new.md"), "new\n").unwrap();
+    let clash = gft.try_run(&other, &["land"]);
+    assert!(!clash.status.success());
+    assert!(String::from_utf8_lossy(&clash.stderr).contains("todo.md"), "{}", String::from_utf8_lossy(&clash.stderr));
+    assert!(!folder.join("new.md").exists(), "nothing was written");
+    // After a sync it is a change on both sides, kept as the copy has it.
+    let synced = gft.run(&other, &["sync"]);
+    assert!(synced.contains("kept yours\ttodo.md") && synced.contains("1 need a look"), "{synced}");
+    gft.run(&other, &["land"]);
+    assert_eq!(std::fs::read_to_string(folder.join("todo.md")).unwrap(), "- a\n- c\n");
+    assert_eq!(std::fs::read_to_string(folder.join("new.md")).unwrap(), "new\n");
+    gft.run(&folder, &["rm", "other"]);
+    assert!(!gft.run(&folder, &["ls"]).contains("other"));
 }
