@@ -729,16 +729,22 @@ fn merge(dir: &Path, old: &str, new: &str, path: &str) -> Result<&'static str> {
     let (base_file, theirs_file) = (tmp.join("base"), tmp.join("theirs"));
     std::fs::write(&base_file, &base)?;
     std::fs::write(&theirs_file, &theirs)?;
+    let result = merge_file(&mine, &base_file, &theirs_file, path);
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+fn merge_file(mine: &Path, base: &Path, theirs: &Path, path: &str) -> Result<&'static str> {
     let out = std::process::Command::new("git")
         .args(["merge-file", "-p", "-L", "yours", "-L", "base", "-L", "upstream"])
-        .args([&mine, &base_file, &theirs_file])
+        .args([mine, base, theirs])
         .output()
         .context("running git merge-file")?;
-    let _ = std::fs::remove_dir_all(&tmp);
-    // Its exit code is the number of conflicts, negative on failure.
+    // Git caps the conflict count at 127. Negative errors appear as 255 on Unix,
+    // so only documented merge results may replace the working file.
     match out.status.code() {
-        Some(code) if code >= 0 => {
-            std::fs::write(&mine, &out.stdout)?;
+        Some(code @ 0..=127) => {
+            std::fs::write(mine, &out.stdout)?;
             Ok(if code == 0 { "merged" } else { "conflict" })
         }
         _ => bail!("git merge-file failed on {path}: {}", String::from_utf8_lossy(&out.stderr).trim()),
@@ -772,6 +778,52 @@ fn mount_copy(copy: &Copy) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_file_errors_leave_working_bytes_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mine, base, theirs) = (dir.path().join("mine"), dir.path().join("missing"), dir.path().join("theirs"));
+        let ours = b"local changes\r\nincluding non-UTF-8: \xff\n";
+        std::fs::write(&mine, ours).unwrap();
+        std::fs::write(&theirs, b"upstream\n").unwrap();
+
+        let result = merge_file(&mine, &base, &theirs, "notes.txt");
+
+        assert_eq!(std::fs::read(&mine).unwrap(), ours);
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("git merge-file failed on notes.txt:"), "{error}");
+    }
+
+    #[test]
+    fn merge_file_combines_non_overlapping_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mine, base, theirs) = (dir.path().join("mine"), dir.path().join("base"), dir.path().join("theirs"));
+        std::fs::write(&base, b"one\ntwo\nthree\nfour\nfive\n").unwrap();
+        std::fs::write(&mine, b"ours\ntwo\nthree\nfour\nfive\n").unwrap();
+        std::fs::write(&theirs, b"one\ntwo\nthree\nfour\nupstream\n").unwrap();
+
+        assert_eq!(merge_file(&mine, &base, &theirs, "notes.txt").unwrap(), "merged");
+        assert_eq!(std::fs::read(&mine).unwrap(), b"ours\ntwo\nthree\nfour\nupstream\n");
+    }
+
+    #[test]
+    fn merge_file_keeps_real_conflicts_including_the_capped_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mine, base, theirs) = (dir.path().join("mine"), dir.path().join("base"), dir.path().join("theirs"));
+        for count in [1, 2, 127, 128] {
+            let contents = |side: &str| (0..count).map(|n| format!("{side} {n}\n\na\nb\nc\n\n")).collect::<String>();
+            std::fs::write(&base, contents("base")).unwrap();
+            std::fs::write(&mine, contents("ours")).unwrap();
+            std::fs::write(&theirs, contents("upstream")).unwrap();
+
+            assert_eq!(merge_file(&mine, &base, &theirs, "notes.txt").unwrap(), "conflict");
+            let merged = std::fs::read_to_string(&mine).unwrap();
+            let expected = (0..count)
+                .map(|n| format!("<<<<<<< yours\nours {n}\n=======\nupstream {n}\n>>>>>>> upstream\n\na\nb\nc\n\n"))
+                .collect::<String>();
+            assert_eq!(merged, expected, "{count} conflicts");
+        }
+    }
 
     #[test]
     fn folder_bases_taken_in_one_second_differ() {
