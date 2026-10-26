@@ -131,6 +131,13 @@ enum Cmd {
         /// request and the files), changing nothing on GitHub or here.
         #[arg(long, short = 'n')]
         dry_run: bool,
+        /// Open a new pull request, on a branch of its own, leaving the copy's earlier
+        /// one as it is: for one closed without being merged.
+        #[arg(long)]
+        new_pr: bool,
+        /// Land files that still have conflict markers from `gft sync`.
+        #[arg(long)]
+        allow_conflicts: bool,
     },
     /// Delete copies, with their snapshots. Their pull requests stay as they are.
     /// A copy with changes that never landed (no pull request, or files changed since
@@ -142,7 +149,30 @@ enum Cmd {
         #[arg(long, short)]
         force: bool,
     },
+    /// Remove a whole project: every copy, the home copy's mount and what Graft keeps
+    /// of it, so `gft get` can start over. A plain folder or a checkout stays as it is.
+    /// Copies with changes that never landed are kept, and the project with them,
+    /// unless `--force` is given.
+    Drop {
+        /// OWNER/NAME, or the home copy's folder name (default: the project here).
+        project: Option<String>,
+        /// Remove copies even if their changes never landed.
+        #[arg(long, short)]
+        force: bool,
+    },
 }
+
+/// A sync that left files with conflict markers, which exits with 2.
+#[derive(Debug)]
+struct Conflicts(usize);
+
+impl std::fmt::Display for Conflicts {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{} conflict markers; settle them, then land", if self.0 == 1 { "1 file has" } else { "files have" })
+    }
+}
+
+impl std::error::Error for Conflicts {}
 
 /// The text of a description file, or of standard input for `-`.
 fn read_body(path: &Path) -> Result<String> {
@@ -161,7 +191,7 @@ pub fn main() {
     sandfs::handle_relaunch(&["sandfs"]);
     if let Err(err) = run(Cli::parse()) {
         eprintln!("gft: {err:#}");
-        std::process::exit(1);
+        std::process::exit(if err.is::<Conflicts>() { 2 } else { 1 });
     }
 }
 
@@ -224,15 +254,18 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Sync { name } => {
             let (project, current) = here(&store)?;
-            sync(&store, &project.repo, &which(name, current)?)
+            match sync(&store, &project.repo, &which(name, current)?)? {
+                0 => Ok(()),
+                conflicts => Err(Conflicts(conflicts).into()),
+            }
         }
-        Cmd::Land { name, message, body, body_file, draft, force, dry_run } => {
+        Cmd::Land { name, message, body, body_file, draft, force, dry_run, new_pr, allow_conflicts } => {
             let (project, current) = here(&store)?;
             if project.folder {
-                if message.is_some() || body.is_some() || body_file.is_some() || draft || force || dry_run {
+                if message.is_some() || body.is_some() || body_file.is_some() || draft || force || dry_run || new_pr {
                     bail!(
-                        "a copy of a folder lands into the folder; --message, --body, --draft, --force and \
-                         --dry-run are for pull requests"
+                        "a copy of a folder lands into the folder; --message, --body, --draft, --force, \
+                         --dry-run and --new-pr are for pull requests"
                     );
                 }
                 return land_folder(&store, &project, &which(name, current)?);
@@ -241,29 +274,85 @@ fn run(cli: Cli) -> Result<()> {
                 Some(path) => Some(read_body(&path)?),
                 None => body,
             };
-            let options = land::Options { message: message.as_deref(), body: body.as_deref(), draft, force, dry_run };
+            let options = land::Options {
+                message: message.as_deref(),
+                body: body.as_deref(),
+                draft,
+                force,
+                dry_run,
+                new_pr,
+                allow_conflicts,
+            };
             land::land(&store, &project.repo, &which(name, current)?, &options)
         }
         Cmd::Rm { names, force } => {
             let (project, _) = here(&store)?;
             leave_mounts()?;
-            // All checked before any is deleted, so a refusal leaves every copy as it was.
-            let mut kept = Vec::new();
-            for name in names.iter().filter(|_| !force) {
-                let lost = unlanded(copy(&project, name)?)?;
-                if lost > 0 {
-                    kept.push(format!("{name} has {} that never landed", files(lost)));
-                }
-            }
-            if !kept.is_empty() {
-                bail!("{}; `gft land` them first, or `gft rm --force` to delete them anyway", kept.join(", "));
+            if !force {
+                keep_unlanded(&project, &names, "gft rm --force")?;
             }
             for name in &names {
                 rm(&store, &project.repo, name)?;
             }
             Ok(())
         }
+        Cmd::Drop { project, force } => {
+            let project = match project {
+                Some(named) => store
+                    .projects()?
+                    .into_iter()
+                    .find(|project| project.repo == named || project.workspace == named)
+                    .with_context(|| format!("no project {named}; `gft ls` lists them"))?,
+                None => here(&store)?.0,
+            };
+            leave_mounts()?;
+            drop_project(&store, &project, force)
+        }
     }
+}
+
+/// Refuse when any of the copies `names` has changes that never landed, all checked
+/// before any is deleted, so a refusal leaves every copy as it was.
+fn keep_unlanded(project: &Project, names: &[String], anyway: &str) -> Result<()> {
+    let mut kept = Vec::new();
+    for name in names {
+        let lost = unlanded(copy(project, name)?)?;
+        if lost > 0 {
+            kept.push(format!("{name} has {} that never landed", files(lost)));
+        }
+    }
+    if !kept.is_empty() {
+        bail!("{}; `gft land` them first, or `{anyway}` to delete them anyway", kept.join(", "));
+    }
+    Ok(())
+}
+
+/// Remove every copy of `project`, then the project itself.
+fn drop_project(store: &Store, project: &Project, force: bool) -> Result<()> {
+    let names: Vec<String> = project.copies.keys().cloned().collect();
+    if !force {
+        keep_unlanded(project, &names, "gft drop --force")?;
+    }
+    for name in &names {
+        rm(store, &project.repo, name)?;
+    }
+    // The home copy of a repository is a mount Graft made; a folder or a checkout is
+    // the user's own.
+    if !project.folder && !project.checkout {
+        let home = sandfs()?;
+        for workspace in [project.workspace.clone(), main_workspace(project)] {
+            let known = home.workspaces()?.into_iter().find(|known| known.name == workspace);
+            if let Some(known) = known {
+                let removed = home.remove(&workspace, known.mounted.is_some());
+                in_use(&project.home, removed)?;
+            }
+        }
+        // Empty once unmounted.
+        let _ = std::fs::remove_dir(&project.home);
+    }
+    store.forget(&project.repo)?;
+    println!("dropped {} ({})", project.repo, project.home.display());
+    Ok(())
 }
 
 /// The project the current folder is in, and the copy.
@@ -309,6 +398,9 @@ fn folder_base(project: &mut Project) -> String {
 fn copied_at(base: &str) -> Option<u64> {
     base.split_once('@')?.1.parse().ok()
 }
+
+/// How many seconds the default branch counts as up to date once fetched.
+const FRESH: u64 = 10;
 
 /// The workspace that holds the default branch as last fetched, which copies fork.
 fn main_workspace(project: &Project) -> String {
@@ -403,6 +495,7 @@ fn get(store: &Store, repo: &str, dir: Option<PathBuf>, github: Option<String>) 
         folder: false,
         checkout: false,
         takes: 0,
+        fetched: now(),
         copies: BTreeMap::new(),
     };
     // Kept before anything changes the home copy, as the start of every new copy.
@@ -455,6 +548,7 @@ fn get_checkout(store: &Store, folder: &Path, github: Option<String>) -> Result<
         folder: false,
         checkout: true,
         takes: 0,
+        fetched: 0,
         copies: BTreeMap::new(),
     };
     store.create(&project)?;
@@ -488,6 +582,7 @@ fn get_folder(store: &Store, folder: &Path) -> Result<()> {
         folder: true,
         checkout: false,
         takes: 0,
+        fetched: 0,
         copies: BTreeMap::new(),
     };
     store.create(&project)?;
@@ -510,6 +605,9 @@ fn new(store: &Store, names: &[String], from: Option<(&str, bool)>) -> Result<()
     }
     // A copy built on top of another sits on that one's landing, as it is now.
     let mut stacked = None;
+    // Held while the default branch is brought up to date and copied, which
+    // `gft new` run at once in many places (an agent each) take turns at.
+    let mut _main = None;
     let (source, mut base) = match from {
         Some((name, on)) => {
             let from = copy(&project, name)?;
@@ -535,9 +633,17 @@ fn new(store: &Store, names: &[String], from: Option<(&str, bool)>) -> Result<()
         // Each copy is the folder, or the checkout, as it is when made.
         None if project.folder || project.checkout => (project.source.clone(), None),
         None => {
-            // Brings the default branch up to date once for all the copies made now.
+            // Brings the default branch up to date once for all the copies made now,
+            // unless that was done moments ago.
+            _main = Some(store.lock_main(&project.repo)?);
             let main = main_workspace(&project);
-            sandfs()?.update(&main, None)?;
+            if now().saturating_sub(store.load(&project.repo)?.fetched) >= FRESH {
+                sandfs()?.update(&main, None)?;
+                store.edit(&project.repo, |project| {
+                    project.fetched = now();
+                    Ok(())
+                })?;
+            }
             (main, None)
         }
     };
@@ -565,6 +671,7 @@ fn new(store: &Store, names: &[String], from: Option<(&str, bool)>) -> Result<()
                 landed: None,
                 pending: None,
                 pr: None,
+                conflicts: BTreeSet::new(),
                 snapshots: Vec::new(),
                 next: 1,
             };
@@ -678,6 +785,11 @@ fn status(store: &Store) -> Result<()> {
         false => println!("on commit  {}", short(&copy.base)),
     }
     println!("changed    {files} {}", if files == 1 { "file" } else { "files" });
+    let marked = marked(copy)?;
+    if !marked.is_empty() {
+        let paths: Vec<&str> = marked.iter().map(String::as_str).collect();
+        println!("conflicts  {} (settle them before landing)", paths.join(", "));
+    }
     println!("snapshots  {}", copy.snapshots.len());
     if let Some(pr) = &copy.pr {
         println!("pull request  {}", pr.url);
@@ -726,46 +838,87 @@ fn ago(secs: u64) -> String {
     }
 }
 
+/// Put the copy back as its snapshot `steps` back has it. What it is now is saved
+/// first, unless a snapshot already has it, and newer snapshots stay: undoing again
+/// goes back to how it was.
 fn undo(store: &Store, repo: &str, name: &str, steps: usize) -> Result<()> {
     let project = store.load(repo)?;
-    let copy = copy(&project, name)?;
+    let copy = copy(&project, name)?.clone();
     if steps == 0 || steps > copy.snapshots.len() {
         bail!("{name} has {} snapshots; `gft save` keeps one", copy.snapshots.len());
     }
-    let keep = copy.snapshots.len() - steps;
-    let target = copy.snapshots[keep].clone();
-    if target.base == copy.base && mounted(&copy.workspace)?.is_some() {
+    let target = copy.snapshots[copy.snapshots.len() - steps].clone();
+    mount_copy(&copy)?;
+    let kept = save_unless_saved(store, repo, name, "before undo")?;
+    if target.base == copy.base {
         // Written back through the mount, file by file, so programs working in the
         // copy (a shell sitting in it) carry on undisturbed. Git's own files stay.
         copy_changes(&target.workspace, Some(&copy.workspace), &copy.dir)?;
     } else {
         // A snapshot from before a sync sits on another commit: the copy is made again.
-        in_use(copy, sandfs()?.remove(&copy.workspace, true))?;
+        in_use(&copy.dir, sandfs()?.remove(&copy.workspace, true))?;
         fork(&target.workspace, Some(&copy.dir), &copy.workspace)?;
-    }
-    // Snapshots newer than the one gone back to go; that one stays, to go back to again.
-    for later in &copy.snapshots[keep + 1..] {
-        sandfs()?.remove(&later.workspace, false)?;
     }
     store.edit(repo, |project| {
         let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
-        copy.snapshots.truncate(keep + 1);
         copy.base = target.base.clone();
         Ok(())
     })?;
     let note = if target.note.is_empty() { String::new() } else { format!(" ({})", target.note) };
-    println!("{name} is back at snapshot {}{note}", target.workspace);
+    let back = match kept {
+        Some(_) => "; `gft undo` again returns to how it was",
+        None => "",
+    };
+    println!("{name} is back at snapshot {}{note}{back}", target.workspace);
     Ok(())
 }
 
-/// An unmount of `copy` refused because something works in it, said plainly.
-fn in_use<T>(copy: &Copy, result: Result<T>) -> Result<T> {
+/// Save the copy as it is now, unless its newest snapshot has it as it is.
+fn save_unless_saved(store: &Store, repo: &str, name: &str, note: &str) -> Result<Option<Snapshot>> {
+    let project = store.load(repo)?;
+    let copy = copy(&project, name)?;
+    if let Some(last) = copy.snapshots.last()
+        && last.base == copy.base
+        && tools::same(&copy.workspace, &last.workspace)?
+    {
+        return Ok(None);
+    }
+    save(store, repo, name, note).map(Some)
+}
+
+/// Delete the snapshot `snapshot` of the copy `name`.
+fn drop_snapshot(store: &Store, repo: &str, name: &str, snapshot: &Snapshot) -> Result<()> {
+    store.edit(repo, |project| {
+        let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
+        copy.snapshots.retain(|kept| kept.workspace != snapshot.workspace);
+        Ok(())
+    })?;
+    sandfs()?.remove(&snapshot.workspace, false)
+}
+
+/// The files `gft sync` left with conflict markers that still have them.
+fn marked(copy: &Copy) -> Result<BTreeSet<String>> {
+    let mut marked = BTreeSet::new();
+    for path in &copy.conflicts {
+        let Ok(data) = std::fs::read(copy.dir.join(path)) else { continue };
+        let lines = data.split(|&byte| byte == b'\n');
+        if lines.into_iter().any(|line| line.starts_with(b"<<<<<<< yours") || line.starts_with(b">>>>>>> upstream")) {
+            marked.insert(path.clone());
+        }
+    }
+    Ok(marked)
+}
+
+/// An unmount of the folder `dir` refused because something works in it, said
+/// plainly: Linux says busy, macOS suggests its own unmount command.
+fn in_use<T>(dir: &Path, result: Result<T>) -> Result<T> {
     result.map_err(|err| {
-        if format!("{err:#}").contains("busy") {
+        let said = format!("{err:#}");
+        if said.contains("busy") || said.contains("diskutil") {
             anyhow::anyhow!(
                 "{} is in use: a shell or program is working in it (its folder or a file in it is open); \
                  leave it, as with `cd ..`, and try again",
-                copy.dir.display()
+                dir.display()
             )
         } else {
             err
@@ -773,17 +926,87 @@ fn in_use<T>(copy: &Copy, result: Result<T>) -> Result<T> {
     })
 }
 
-fn sync(store: &Store, repo: &str, name: &str) -> Result<()> {
-    save(store, repo, name, "before sync")?;
+/// Work of a copy's that GitHub merged since the copy last synced: its own last
+/// landing, or the landing it was built on. The copy's files started from that
+/// landing, so it, not the copy's base, is what upstream's version is merged from.
+struct Merged {
+    github: github::GitHub,
+    /// The landing's commit.
+    commit: String,
+    /// What happened, for people.
+    said: String,
+    /// The pull request of the copy's own that is over: closed with the branch under
+    /// it, or merged.
+    done: bool,
+}
+
+/// What of the copy's GitHub merged since it last synced, if anything.
+fn merged(project: &Project, copy: &Copy, name: &str) -> Result<Option<Merged>> {
+    if project.folder || (copy.stacked.is_none() && copy.pr.is_none()) {
+        return Ok(None);
+    }
+    let github = github::GitHub::new(&project.repo)?;
+    let pull = match &copy.pr {
+        Some(pr) => Some((pr.number, github.call("GET", &format!("pulls/{}", pr.number), None)?)),
+        None => None,
+    };
+    if let (Some((number, pull)), Some(landed)) = (&pull, &copy.landed)
+        && pull["merged_at"].is_string()
+        && !landed.commit.is_empty()
+    {
+        let said = format!("pull request #{number} was merged; {name} lands next as a new one");
+        return Ok(Some(Merged { commit: landed.commit.clone(), said, done: true, github }));
+    }
+    let Some(stacked) = &copy.stacked else { return Ok(None) };
+    let Some(number) = land::merged_pull(&github, &project.repo, &stacked.branch)? else { return Ok(None) };
+    let mut said = format!("{} was merged (#{number}); {name} now builds on {}", stacked.branch, project.branch);
+    // GitHub closes a pull request whose base branch goes, and it can't be reopened.
+    let closed = pull.as_ref().filter(|(_, pull)| pull["state"] != "open");
+    if let Some((number, _)) = closed {
+        said.push_str(&format!("; its pull request #{number} closed with that branch, so `gft land` opens a new one"));
+    }
+    Ok(Some(Merged { commit: stacked.commit.clone(), said, done: closed.is_some(), github }))
+}
+
+/// Move a copy onto the newest commit of the default branch, or the folder as it is
+/// now. Says how many files have conflict markers, from this sync or an earlier one.
+fn sync(store: &Store, repo: &str, name: &str) -> Result<usize> {
     let project = store.load(repo)?;
     let copy = copy(&project, name)?.clone();
     mount_copy(&copy)?;
+    let merged = merged(&project, &copy, name)?;
+    let saved = save_unless_saved(store, repo, name, "before sync")?;
+    let synced = sync_saved(store, &project, &copy, name, merged.as_ref());
+    // A snapshot of a copy the sync didn't touch only clutters the list.
+    if let Some(snapshot) = saved
+        && synced.as_ref().map_or(true, |moved| !moved)
+    {
+        drop_snapshot(store, repo, name, &snapshot)?;
+    }
+    synced?;
+    // Conflicts left by this sync or an earlier one count until they are settled.
+    let project = store.load(repo)?;
+    let marked = marked(self::copy(&project, name)?)?;
+    if !marked.is_empty() {
+        let paths: Vec<&str> = marked.iter().map(String::as_str).collect();
+        println!("conflict markers in: {}", paths.join(", "));
+    }
+    Ok(marked.len())
+}
+
+/// The rest of `sync`, once the copy is saved: whether it moved.
+fn sync_saved(store: &Store, project: &Project, copy: &Copy, name: &str, merged: Option<&Merged>) -> Result<bool> {
+    let repo = &project.repo;
     // Moved in place, so programs working in the copy carry on.
     let updated = sandfs()?.update(&copy.workspace, None)?;
     let commit = match project.folder {
         true => None,
         false => Some(git(&copy.dir, &["rev-parse", "HEAD"])?),
     };
+    if commit.as_ref() == Some(&copy.base) && updated.both.is_empty() {
+        println!("{name} is up to date at {}", short(&copy.base));
+        return Ok(false);
+    }
     let new = store.edit(repo, |project| {
         let base = commit.clone().unwrap_or_else(|| folder_base(project));
         let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
@@ -791,24 +1014,53 @@ fn sync(store: &Store, repo: &str, name: &str) -> Result<()> {
         Ok(base)
     })?;
     let both = &updated.both;
-    let mut conflicts = 0;
+    let mut conflicts = BTreeSet::new();
+    let mut looks = 0;
     for path in both {
-        // A folder keeps no older version to merge from.
-        let outcome = match project.folder {
-            true => "changed in the folder too; kept yours",
-            false => merge(&copy.dir, &copy.base, &new, path)?,
+        let outcome = match (project.folder, merged) {
+            // A folder keeps no older version to merge from.
+            (true, _) => "changed in the folder too; kept yours",
+            (false, Some(merged)) => {
+                let base = land::file_at(&merged.github, &merged.commit, path)?;
+                merge(&copy.dir, base, &new, path)?
+            }
+            (false, None) => {
+                let base = tools::git_raw(&copy.dir, &["show", &format!("{}:{path}", copy.base)]).ok();
+                merge(&copy.dir, base, &new, path)?
+            }
         };
+        if outcome == "conflict" {
+            conflicts.insert(path.clone());
+        }
         if outcome != "merged" {
-            conflicts += 1;
+            looks += 1;
         }
         println!("{outcome}\t{path}");
+    }
+    store.edit(repo, |project| {
+        let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
+        copy.conflicts.extend(conflicts.iter().cloned());
+        if let Some(merged) = merged {
+            // That work is the default branch's now: the copy stands on that alone,
+            // and what it lands next is new.
+            copy.stacked = None;
+            if merged.done {
+                copy.pr = None;
+                copy.landed = None;
+                copy.pending = None;
+            }
+        }
+        Ok(())
+    })?;
+    if let Some(merged) = merged {
+        println!("{}", merged.said);
     }
     let moved = match project.folder {
         true => format!("{name} now has {} as it is", project.home.display()),
         false => format!("{name} moved from {} to {}", short(&copy.base), short(&new)),
     };
-    println!("{moved}; {} files changed on both sides, {conflicts} need a look", both.len());
-    Ok(())
+    println!("{moved}; {} changed on both sides, {looks} need a look", files(both.len()));
+    Ok(true)
 }
 
 /// Write a copy's changes into the plain folder it is a copy of, refusing them all if
@@ -833,10 +1085,10 @@ fn land_folder(store: &Store, project: &Project, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Merge upstream's change to `path` between commits `old` and `new` into the copy's
-/// version in `dir`, line by line, leaving conflict markers where both changed the
-/// same lines. Says what happened.
-fn merge(dir: &Path, old: &str, new: &str, path: &str) -> Result<&'static str> {
+/// Merge upstream's change to `path`, from `base` (what the copy started from there;
+/// none for no file) to commit `new`, into the copy's version in `dir`, line by line,
+/// leaving conflict markers where both changed the same lines. Says what happened.
+fn merge(dir: &Path, base: Option<Vec<u8>>, new: &str, path: &str) -> Result<&'static str> {
     let mine = dir.join(path);
     let meta = std::fs::symlink_metadata(&mine);
     if !meta.as_ref().is_ok_and(|meta| meta.is_file()) {
@@ -844,7 +1096,7 @@ fn merge(dir: &Path, old: &str, new: &str, path: &str) -> Result<&'static str> {
     }
     let show = |commit: &str| tools::git_raw(dir, &["show", &format!("{commit}:{path}")]).ok();
     let Some(theirs) = show(new) else { return Ok("deleted upstream, changed here; kept yours") };
-    let base = show(old).unwrap_or_default();
+    let base = base.unwrap_or_default();
     let ours = std::fs::read(&mine)?;
     if [&ours, &base, &theirs].iter().any(|data| data.contains(&0)) {
         return Ok("binary, changed on both sides; kept yours");
@@ -880,13 +1132,15 @@ fn rm(store: &Store, repo: &str, name: &str) -> Result<()> {
     let project = store.load(repo)?;
     let copy = copy(&project, name)?;
     if mounted(&copy.workspace)?.is_some() {
-        in_use(copy, sandfs()?.remove(&copy.workspace, true))?;
+        in_use(&copy.dir, sandfs()?.remove(&copy.workspace, true))?;
     } else {
         sandfs()?.remove(&copy.workspace, false)?;
     }
     for snapshot in &copy.snapshots {
         sandfs()?.remove(&snapshot.workspace, false)?;
     }
+    // Empty once unmounted.
+    let _ = std::fs::remove_dir(&copy.dir);
     store.edit(repo, |project| {
         project.copies.remove(name);
         Ok(())
@@ -961,6 +1215,7 @@ mod tests {
             folder: true,
             checkout: false,
             takes: 0,
+            fetched: 0,
             copies: BTreeMap::new(),
         };
         let (a, b) = (folder_base(&mut project), folder_base(&mut project));
