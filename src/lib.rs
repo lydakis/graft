@@ -54,10 +54,18 @@ enum Cmd {
     /// List the copies: how many files each changed, the commit it sits on, its pull
     /// request, and which other copies changed the same files.
     Ls,
+    /// Describe the copy the current folder is in, or the project from its home copy.
+    Status,
     /// Print the folder of a copy.
     Path { name: String },
     /// List the files a copy changed (A, M, D), or how copy A differs from copy B.
-    Changes { a: Option<String>, b: Option<String> },
+    Changes {
+        a: Option<String>,
+        b: Option<String>,
+        /// Print only the totals, like `3 added, 5 modified, 1 deleted`.
+        #[arg(long)]
+        count: bool,
+    },
     /// Keep a snapshot of the copy as it is now, which `undo` goes back to.
     Save {
         /// What the snapshot is, for `gft ls`.
@@ -70,6 +78,9 @@ enum Cmd {
     Undo {
         #[arg(default_value_t = 1)]
         steps: usize,
+        /// List the snapshots, newest first, numbered as N counts them, and change nothing.
+        #[arg(long, conflicts_with = "steps")]
+        list: bool,
         #[arg(long, short)]
         copy: Option<String>,
     },
@@ -83,15 +94,38 @@ enum Cmd {
         /// The pull request's title, and the commit's message.
         #[arg(long, short)]
         message: Option<String>,
+        /// The pull request's description. On a pull request already open, it replaces
+        /// the description there.
+        #[arg(long, conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Read the description from a file, or from standard input for `-`.
+        #[arg(long, value_name = "PATH")]
+        body_file: Option<PathBuf>,
         /// Open the pull request as a draft.
         #[arg(long)]
         draft: bool,
     },
     /// Delete copies, with their snapshots. Their pull requests stay as they are.
+    /// A copy with changes that never landed (no pull request, or files changed since
+    /// its last landing) is kept unless `--force` is given.
     Rm {
         #[arg(required = true)]
         names: Vec<String>,
+        /// Delete the copies even if their changes never landed.
+        #[arg(long, short)]
+        force: bool,
     },
+}
+
+/// The text of a description file, or of standard input for `-`.
+fn read_body(path: &Path) -> Result<String> {
+    if path == Path::new("-") {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+            .context("reading the description from standard input")?;
+        return Ok(text);
+    }
+    std::fs::read_to_string(path).with_context(|| format!("reading the description from {}", path.display()))
 }
 
 pub fn main() {
@@ -107,12 +141,13 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Get { repo, dir, github } => get(&store, &repo, dir, github),
         Cmd::New { names, from } => new(&store, &names, from.as_deref()),
         Cmd::Ls => ls(&store),
+        Cmd::Status => status(&store),
         Cmd::Path { name } => {
             let (project, _) = here(&store)?;
             println!("{}", copy(&project, &name)?.dir.display());
             Ok(())
         }
-        Cmd::Changes { a, b } => {
+        Cmd::Changes { a, b, count } => {
             let (project, current) = here(&store)?;
             let workspace = |name: Option<String>| -> Result<(String, PathBuf)> {
                 match name.or(current.clone()) {
@@ -125,8 +160,14 @@ fn run(cli: Cli) -> Result<()> {
             };
             let (a, dir) = workspace(a)?;
             let b = b.map(|b| workspace(Some(b)).map(|(b, _)| b)).transpose()?;
-            for change in changes(&a, b.as_deref(), &dir)? {
-                println!("{} {}", change.kind, change.path);
+            let changes = changes(&a, b.as_deref(), &dir)?;
+            if count {
+                let of = |kind| changes.iter().filter(|change| change.kind == kind).count();
+                println!("{} added, {} modified, {} deleted", of('A'), of('M'), of('D'));
+            } else {
+                for change in changes {
+                    println!("{} {}", change.kind, change.path);
+                }
             }
             Ok(())
         }
@@ -137,7 +178,11 @@ fn run(cli: Cli) -> Result<()> {
             println!("saved {name} as snapshot {}", snapshot.workspace);
             Ok(())
         }
-        Cmd::Undo { steps, copy: name } => {
+        Cmd::Undo { list: true, copy: name, .. } => {
+            let (project, current) = here(&store)?;
+            snapshots(&project, &which(name, current)?)
+        }
+        Cmd::Undo { steps, copy: name, .. } => {
             let (project, current) = here(&store)?;
             leave_mounts()?;
             undo(&store, &project.repo, &which(name, current)?, steps)
@@ -147,13 +192,28 @@ fn run(cli: Cli) -> Result<()> {
             leave_mounts()?;
             sync(&store, &project.repo, &which(name, current)?)
         }
-        Cmd::Land { name, message, draft } => {
+        Cmd::Land { name, message, body, body_file, draft } => {
             let (project, current) = here(&store)?;
-            land::land(&store, &project.repo, &which(name, current)?, message.as_deref(), draft)
+            let body = match body_file {
+                Some(path) => Some(read_body(&path)?),
+                None => body,
+            };
+            land::land(&store, &project.repo, &which(name, current)?, message.as_deref(), body.as_deref(), draft)
         }
-        Cmd::Rm { names } => {
+        Cmd::Rm { names, force } => {
             let (project, _) = here(&store)?;
             leave_mounts()?;
+            // All checked before any is deleted, so a refusal leaves every copy as it was.
+            let mut kept = Vec::new();
+            for name in names.iter().filter(|_| !force) {
+                let lost = unlanded(copy(&project, name)?)?;
+                if lost > 0 {
+                    kept.push(format!("{name} has {} that never landed", files(lost)));
+                }
+            }
+            if !kept.is_empty() {
+                bail!("{}; `gft land` them first, or `gft rm --force` to delete them anyway", kept.join(", "));
+            }
             for name in &names {
                 rm(&store, &project.repo, name)?;
             }
@@ -179,7 +239,14 @@ fn which(name: Option<String>, current: Option<String>) -> Result<String> {
 }
 
 fn copy<'a>(project: &'a Project, name: &str) -> Result<&'a Copy> {
-    project.copies.get(name).with_context(|| format!("{} has no copy {name:?}; `gft ls` lists them", project.repo))
+    project.copies.get(name).with_context(|| {
+        let names: Vec<&str> = project.copies.keys().map(String::as_str).collect();
+        if names.is_empty() {
+            format!("{} has no copy {name:?} (it has no copies yet); make one with `gft new {name}`", project.repo)
+        } else {
+            format!("{} has no copy {name:?}; its copies are: {}", project.repo, names.join(", "))
+        }
+    })
 }
 
 fn now() -> u64 {
@@ -191,28 +258,46 @@ fn main_workspace(project: &Project) -> String {
     format!("{}._main", project.workspace)
 }
 
+/// `owner/name` from a path such as `owner/name`, `owner/name.git` or `owner/name/`.
+/// Anything else (a lone name, extra folders, odd characters) is not a repository.
+fn owner_name(path: &str) -> Option<String> {
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, name) = path.split_once('/')?;
+    let valid = |part: &str| {
+        !matches!(part, "" | "." | "..") && part.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    };
+    (valid(owner) && valid(name)).then(|| format!("{owner}/{name}"))
+}
+
+/// The host and path of a URL (`https://host/path`, `ssh://git@host/path`) or of the
+/// `git@host:path` form that git also accepts.
+fn host_and_path(repo: &str) -> Option<(&str, &str)> {
+    let (authority, path) = match repo.split_once("://") {
+        Some((_, rest)) => rest.split_once('/').unwrap_or((rest, "")),
+        None => repo.split_once(':')?,
+    };
+    let host = authority.rsplit('@').next()?.split(':').next()?;
+    Some((host, path.split(['?', '#']).next()?))
+}
+
 /// `owner/name` and the URL to mount for what `gft get` was given.
 fn parse_repo(repo: &str, github: Option<String>) -> Result<(String, String)> {
-    let slug = |text: &str| {
-        let text = text.trim_end_matches('/').trim_end_matches(".git");
-        let mut parts = text.rsplitn(3, '/');
-        match (parts.next(), parts.next()) {
-            (Some(name), Some(owner)) if !name.is_empty() && !owner.is_empty() => {
-                Some(format!("{}/{name}", owner.rsplit(':').next().unwrap_or(owner)))
-            }
-            _ => None,
-        }
-    };
+    let github = github.map(|text| owner_name(&text).context("--github takes OWNER/NAME")).transpose()?;
     if repo.contains("://") || repo.contains('@') {
-        let on_github = repo.contains("github.com");
+        // The host decides, so a github.com that only appears in the path doesn't count.
+        let (host, path) = host_and_path(repo).with_context(|| format!("can't read {repo} as a repository URL"))?;
+        let on_github = host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("www.github.com");
         let slug = match github {
             Some(slug) => slug,
-            None if on_github => slug(repo).context("can't tell the repository's owner and name")?,
+            None if on_github => {
+                owner_name(path.trim_start_matches('/')).context("can't tell the repository's owner and name")?
+            }
             None => bail!("{repo} isn't on github.com; say where copies land with --github OWNER/NAME"),
         };
         return Ok((slug, repo.to_owned()));
     }
-    let slug = slug(repo).filter(|_| repo.matches('/').count() == 1).context("give the repository as OWNER/NAME")?;
+    let slug = owner_name(repo).context("give the repository as OWNER/NAME")?;
     let url = format!("https://github.com/{slug}");
     Ok((github.unwrap_or(slug), url))
 }
@@ -245,10 +330,13 @@ fn get(store: &Store, repo: &str, dir: Option<PathBuf>, github: Option<String>) 
 
 fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
     let (project, _) = here(store)?;
-    for name in names {
+    for (i, name) in names.iter().enumerate() {
         check_copy_name(name)?;
+        if names[..i].contains(name) {
+            bail!("{name:?} is given twice; each new copy needs its own name");
+        }
         if project.copies.contains_key(name) {
-            bail!("{} already has a copy {name:?}", project.repo);
+            bail!("{} already has a copy {name:?}; pick another name, or remove it with `gft rm {name}`", project.repo);
         }
     }
     let (source, mut base) = match from {
@@ -292,8 +380,22 @@ fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// The project of the current copy; outside any copy, every project Graft knows.
 fn ls(store: &Store) -> Result<()> {
-    let (project, _) = here(store)?;
+    match here(store) {
+        Ok((project, _)) => list(&project),
+        Err(err) => {
+            let mut projects = store.projects()?;
+            if projects.is_empty() {
+                return Err(err);
+            }
+            projects.sort_by(|a, b| a.repo.cmp(&b.repo));
+            projects.iter().try_for_each(list)
+        }
+    }
+}
+
+fn list(project: &Project) -> Result<()> {
     println!("{}\t{}\t(home, {})", project.workspace, project.home.display(), project.branch);
     let mut changed: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for (name, copy) in &project.copies {
@@ -314,11 +416,51 @@ fn ls(store: &Store) -> Result<()> {
             }
         }
         let pr = copy.pr.as_ref().map_or("-".to_owned(), |pr| pr.url.clone());
-        let files = match mine.len() {
-            1 => "1 file".to_owned(),
-            n => format!("{n} files"),
-        };
+        let files = files(mine.len());
         println!("{name}\t{files}\tbase {}\t{pr}\t{}", short(&copy.base), notes.join("; "));
+    }
+    Ok(())
+}
+
+fn files(n: usize) -> String {
+    match n {
+        1 => "1 file".to_owned(),
+        n => format!("{n} files"),
+    }
+}
+
+/// How many of the copy's changed files would be lost: all of them when it has no
+/// pull request, else those not as they were at the last landing.
+fn unlanded(copy: &Copy) -> Result<usize> {
+    mount_copy(copy)?;
+    let changed = changes(&copy.workspace, None, &copy.dir)?;
+    let Some(pr) = &copy.pr else { return Ok(changed.len()) };
+    let mut lost = 0;
+    for change in &changed {
+        if pr.landed.get(&change.path) != Some(&land::fingerprint(&copy.dir, change)?) {
+            lost += 1;
+        }
+    }
+    Ok(lost)
+}
+
+fn status(store: &Store) -> Result<()> {
+    let (project, current) = here(store)?;
+    let Some(name) = current else {
+        println!("project  {}", project.repo);
+        println!("folder   {}", project.home.display());
+        println!("copies   {}", project.copies.len());
+        return Ok(());
+    };
+    let copy = copy(&project, &name)?;
+    let files = changes(&copy.workspace, None, &copy.dir)?.len();
+    println!("copy       {name}");
+    println!("folder     {}", copy.dir.display());
+    println!("on commit  {}", short(&copy.base));
+    println!("changed    {files} {}", if files == 1 { "file" } else { "files" });
+    println!("snapshots  {}", copy.snapshots.len());
+    if let Some(pr) = &copy.pr {
+        println!("pull request  {}", pr.url);
     }
     Ok(())
 }
@@ -338,6 +480,30 @@ fn save(store: &Store, repo: &str, name: &str, note: &str) -> Result<Snapshot> {
         copy.snapshots.push(snapshot.clone());
         Ok(snapshot)
     })
+}
+
+/// Print the copy's snapshots, newest first, numbered as `undo N` counts them.
+fn snapshots(project: &Project, name: &str) -> Result<()> {
+    let copy = copy(project, name)?;
+    if copy.snapshots.is_empty() {
+        println!("{name} has no snapshots; `gft save` keeps one");
+    }
+    let now = now();
+    for (n, snapshot) in copy.snapshots.iter().rev().enumerate() {
+        let note = if snapshot.note.is_empty() { "(no note)" } else { &snapshot.note };
+        println!("{}\t{}\t{note}", n + 1, ago(now.saturating_sub(snapshot.time)));
+    }
+    Ok(())
+}
+
+/// How long ago, for a number of seconds, in the largest unit that fits.
+fn ago(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs} sec ago"),
+        60..3600 => format!("{} min ago", secs / 60),
+        3600..86400 => format!("{} hr ago", secs / 3600),
+        _ => format!("{} days ago", secs / 86400),
+    }
 }
 
 fn undo(store: &Store, repo: &str, name: &str, steps: usize) -> Result<()> {
@@ -488,13 +654,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn times_are_told_in_the_largest_unit() {
+        assert_eq!(ago(0), "0 sec ago");
+        assert_eq!(ago(59), "59 sec ago");
+        assert_eq!(ago(180), "3 min ago");
+        assert_eq!(ago(7300), "2 hr ago");
+        assert_eq!(ago(3 * 86400), "3 days ago");
+    }
+
+    #[test]
     fn repositories_are_named_by_owner_and_name() {
         let parse = |repo: &str| parse_repo(repo, None).unwrap();
         assert_eq!(parse("lydakis/sandfs"), ("lydakis/sandfs".into(), "https://github.com/lydakis/sandfs".into()));
-        assert_eq!(parse("https://github.com/lydakis/sandfs.git").0, "lydakis/sandfs");
-        assert_eq!(parse("git@github.com:lydakis/sandfs.git").0, "lydakis/sandfs");
-        assert!(parse_repo("sandfs", None).is_err());
+        assert_eq!(parse("lydakis/sandfs.git").0, "lydakis/sandfs");
+        assert_eq!(parse("lydakis/sandfs/").0, "lydakis/sandfs");
+        for url in [
+            "https://github.com/lydakis/sandfs",
+            "https://github.com/lydakis/sandfs.git",
+            "https://github.com/lydakis/sandfs/",
+            "https://github.com/lydakis/sandfs.git/",
+            "http://github.com/lydakis/sandfs",
+            "https://www.github.com/lydakis/sandfs",
+            "git@github.com:lydakis/sandfs.git",
+            "git@github.com:lydakis/sandfs",
+            "ssh://git@github.com/lydakis/sandfs",
+            "ssh://git@github.com:22/lydakis/sandfs.git",
+        ] {
+            assert_eq!(parse(url), ("lydakis/sandfs".into(), url.into()), "{url}");
+        }
+    }
+
+    #[test]
+    fn other_hosts_need_to_say_where_copies_land() {
+        let other = "https://gitlab.com/lydakis/sandfs";
+        assert!(parse_repo(other, None).is_err());
+        assert_eq!(parse_repo(other, Some("o/n".into())).unwrap(), ("o/n".into(), other.into()));
         assert!(parse_repo("file:///srv/sandfs", None).is_err());
         assert_eq!(parse_repo("file:///srv/sandfs", Some("o/n".into())).unwrap().0, "o/n");
+        // github.com in the path or in a longer host name is not GitHub.
+        assert!(parse_repo("https://example.com/github.com/lydakis/sandfs", None).is_err());
+        assert!(parse_repo("https://github.com.example.com/lydakis/sandfs", None).is_err());
+        // Plain OWNER/NAME mounts from GitHub and lands wherever --github says.
+        assert_eq!(parse_repo("a/b", Some("o/n".into())).unwrap(), ("o/n".into(), "https://github.com/a/b".into()));
+    }
+
+    #[test]
+    fn bad_repositories_are_refused() {
+        for repo in [
+            "",
+            "sandfs",
+            "/",
+            "a/b/c",
+            "/a/b",
+            "./a",
+            "../a",
+            "a/",
+            "/b",
+            "a b/c",
+            "a/.git",
+            "github.com:a/b",
+            "https://github.com/sandfs",
+            "https://github.com/",
+            "https://github.com",
+            "https://github.com/a/b/tree/main",
+            "git@github.com:sandfs.git",
+            "git@github.com",
+        ] {
+            assert!(parse_repo(repo, None).is_err(), "{repo:?} should be refused");
+        }
+        assert!(parse_repo("a/b", Some("nope".into())).is_err());
+        assert!(parse_repo("https://gitlab.com/a/b", Some("a/b/c".into())).is_err());
     }
 }
