@@ -20,8 +20,7 @@ path = "src/bin/graft.rs"
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
-# Until the sandfs library is released.
-sandfs = { git = "https://github.com/lydakis/sandfs", branch = "main" }
+sandfs = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

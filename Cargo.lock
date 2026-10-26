@@ -640,8 +640,9 @@ dependencies = [
 
 [[package]]
 name = "sandfs"
-version = "0.6.0"
-source = "git+https://github.com/lydakis/sandfs?branch=main#3fefc8aec8d368416cfc7b46867f9a85dbb4a8a3"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ede33e26dfc16bcb7f34d4e2f3f9ccc5cc8fa6ec22932bed727fdaa038d2994"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -665,8 +666,9 @@ dependencies = [
 
 [[package]]
 name = "sandfs-core"
-version = "0.6.0"
-source = "git+https://github.com/lydakis/sandfs?branch=main#3fefc8aec8d368416cfc7b46867f9a85dbb4a8a3"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ede335f86705f15bba11de9bc9962d5a43205371586e66f23957e31b25eee28b"
 dependencies = [
  "bytes",
  "imbl",
@@ -676,8 +678,9 @@ dependencies = [
 
 [[package]]
 name = "sandfs-git"
-version = "0.6.0"
-source = "git+https://github.com/lydakis/sandfs?branch=main#3fefc8aec8d368416cfc7b46867f9a85dbb4a8a3"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f78e78c668eec28066bddf98d12097d44369fd5574a3583eb05c13fab7d72566"
 dependencies = [
  "bytes",
  "sandfs-core",
@@ -685,8 +688,9 @@ dependencies = [
 
 [[package]]
 name = "sandfs-mcp"
-version = "0.6.0"
-source = "git+https://github.com/lydakis/sandfs?branch=main#3fefc8aec8d368416cfc7b46867f9a85dbb4a8a3"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94fe7734bd709eb61a9c3ccf927c8bed3be082934ddae9f5e0b03b417a40c62c"
 dependencies = [
  "base64 0.23.1",
  "globset",
