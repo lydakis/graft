@@ -635,9 +635,20 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
     let forced = made.lock().unwrap().refs["heads/graft/fix"].clone();
     assert_eq!(made.lock().unwrap().commits.last().unwrap()["parents"], json!(["pushed"]));
 
-    // A copy of fix sits on fix's landing as it was: fix landing more since changes
-    // neither what it holds nor what its own landing follows.
-    gft.run(&home, &["new", "child", "--from", "fix"]);
+    // Only a copy that landed can be built on.
+    gft.run(&home, &["new", "unlanded"]);
+    let said = String::from_utf8_lossy(&gft.try_run(&home, &["new", "nope", "--on", "unlanded"]).stderr).into_owned();
+    assert!(said.contains("unlanded hasn't landed, so there is no branch to build on"), "{said}");
+    gft.run(&home, &["rm", "unlanded"]);
+
+    // A copy built on fix sits on fix's landing as it was: fix landing more since
+    // changes neither what it holds nor what its own landing follows.
+    gft.run(&home, &["new", "child", "--on", "fix"]);
+    // Another attempt from fix's files is no stack: it goes to main with all of them.
+    gft.run(&home, &["new", "alt", "--from", "fix"]);
+    let plan = gft.run(&at("alt"), &["land", "-n"]);
+    assert!(plan.contains("against main\n") && plan.contains(&format!("on {}\n", &first[..10])), "{plan}");
+    gft.run(&home, &["rm", "--force", "alt"]);
     std::fs::write(at("fix").join("notes.txt"), "fix, more, and later\n").unwrap();
     gft.run(&at("fix"), &["land"]);
     assert_ne!(made.lock().unwrap().refs["heads/graft/fix"], forced);

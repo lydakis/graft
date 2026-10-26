@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
-use crate::state::{Copy, Project, Snapshot, Store, check_copy_name};
+use crate::state::{Copy, Landing, Project, Snapshot, Store, check_copy_name};
 use crate::tools::{changes, copy_changes, ensure_mounted, fork, git, mount, mounted, path_str, sandfs, short};
 
 #[derive(Parser)]
@@ -57,9 +57,14 @@ enum Cmd {
     New {
         #[arg(required = true)]
         names: Vec<String>,
-        /// Start from this copy instead, with its changes.
-        #[arg(long, value_name = "COPY")]
+        /// Start from this copy's files, as another attempt at the same work: its pull
+        /// request goes against the default branch and carries all of them.
+        #[arg(long, value_name = "COPY", conflicts_with = "on")]
         from: Option<String>,
+        /// Build on top of this copy's landing, as work that depends on it: its pull
+        /// request goes against that copy's branch and shows only its own changes.
+        #[arg(long, value_name = "COPY")]
+        on: Option<String>,
     },
     /// List the copies: how many files each changed, the commit it sits on, its pull
     /// request, and which other copies changed the same files.
@@ -164,7 +169,10 @@ fn run(cli: Cli) -> Result<()> {
     let store = Store::locate()?;
     match cli.command {
         Cmd::Get { repo, dir, github } => get(&store, &repo, dir, github),
-        Cmd::New { names, from } => new(&store, &names, from.as_deref()),
+        Cmd::New { names, from, on } => match on {
+            Some(on) => new(&store, &names, Some((&on, true))),
+            None => new(&store, &names, from.as_deref().map(|from| (from, false))),
+        },
         Cmd::Ls => ls(&store),
         Cmd::Status => status(&store),
         Cmd::Path { name } => {
@@ -427,7 +435,9 @@ fn get_folder(store: &Store, folder: &Path) -> Result<()> {
     Ok(())
 }
 
-fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
+/// Make copies of the default branch, or of the copy `from`: built on top of its
+/// landing when `on` is set, else as another attempt.
+fn new(store: &Store, names: &[String], from: Option<(&str, bool)>) -> Result<()> {
     let (project, _) = here(store)?;
     for (i, name) in names.iter().enumerate() {
         check_copy_name(name)?;
@@ -438,16 +448,27 @@ fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
             bail!("{} already has a copy {name:?}; pick another name, or remove it with `gft rm {name}`", project.repo);
         }
     }
-    // A copy of a copy that landed sits on that landing, as it is now.
+    // A copy built on top of another sits on that one's landing, as it is now.
     let mut stacked = None;
     let (source, mut base) = match from {
-        Some(from) => {
-            let from = copy(&project, from)?;
-            // A landing kept by Graft before 0.1 doesn't say its commit until that copy
-            // lands again, so nothing is built on it until then.
-            stacked = from.landed.clone().or_else(|| from.stacked.clone()).filter(|landed| !landed.commit.is_empty());
-            if let Some(stacked) = &mut stacked {
-                stacked.files.clear();
+        Some((name, on)) => {
+            let from = copy(&project, name)?;
+            if on {
+                if project.folder {
+                    bail!("a copy of a folder lands into the folder, so there is nothing to build on; use --from");
+                }
+                let Some(landed) = &from.landed else {
+                    bail!(
+                        "{name} hasn't landed, so there is no branch to build on: land it first (a draft will do), \
+                         or start from its files with --from"
+                    );
+                };
+                // A landing kept by Graft before 0.1 doesn't say its commit until that
+                // copy lands again.
+                if landed.commit.is_empty() {
+                    bail!("land {name} once more first: Graft before 0.1 didn't keep which commit it landed");
+                }
+                stacked = Some(Landing { files: BTreeMap::new(), ..landed.clone() });
             }
             (from.workspace.clone(), Some(from.base.clone()))
         }
@@ -479,7 +500,7 @@ fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
                 dir: dir.clone(),
                 workspace,
                 base,
-                from: from.map(str::to_owned),
+                from: from.map(|(from, _)| from.to_owned()),
                 stacked: stacked.clone(),
                 landed: None,
                 pending: None,
