@@ -271,6 +271,18 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
+/// A new base for a copy of a folder: when it was taken, as `SECONDS.NANOS`. The
+/// nanoseconds tell apart bases taken in the same second, since `undo` compares them.
+fn folder_base() -> String {
+    let time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    format!("{}.{:09}", time.as_secs(), time.subsec_nanos())
+}
+
+/// When a copy of a folder took its base, in seconds.
+fn copied_at(base: &str) -> Option<u64> {
+    base.split('.').next()?.parse().ok()
+}
+
 /// The workspace that holds the default branch as last fetched, which copies fork.
 fn main_workspace(project: &Project) -> String {
     format!("{}._main", project.workspace)
@@ -428,7 +440,7 @@ fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
         sandfs(&["fork", &source, path_str(&dir)?, "--name", &workspace])?;
         let commit = match &base {
             Some(commit) => commit.clone(),
-            None if project.folder => now().to_string(),
+            None if project.folder => folder_base(),
             None => git(&dir, &["rev-parse", "HEAD"])?,
         };
         base = base.or_else(|| (!project.folder).then(|| commit.clone()));
@@ -495,8 +507,8 @@ fn list(project: &Project) -> Result<()> {
 
 /// What a copy sits on: `base COMMIT`, or for a copy of a folder `copied … ago`.
 fn based(project: &Project, base: &str) -> String {
-    match base.parse::<u64>() {
-        Ok(time) if project.folder => format!("copied {}", ago(now().saturating_sub(time))),
+    match copied_at(base) {
+        Some(time) if project.folder => format!("copied {}", ago(now().saturating_sub(time))),
         _ => format!("base {}", short(base)),
     }
 }
@@ -536,7 +548,7 @@ fn status(store: &Store) -> Result<()> {
     println!("copy       {name}");
     println!("folder     {}", copy.dir.display());
     match project.folder {
-        true => println!("copied     {}", ago(now().saturating_sub(copy.base.parse().unwrap_or(0)))),
+        true => println!("copied     {}", ago(now().saturating_sub(copied_at(&copy.base).unwrap_or(0)))),
         false => println!("on commit  {}", short(&copy.base)),
     }
     println!("changed    {files} {}", if files == 1 { "file" } else { "files" });
@@ -643,7 +655,7 @@ fn sync(store: &Store, repo: &str, name: &str) -> Result<()> {
     // Moved in place, so programs working in the copy carry on.
     let (out, _) = sandfs(&["update", &copy.workspace])?;
     let new = match project.folder {
-        true => now().to_string(),
+        true => folder_base(),
         false => git(&copy.dir, &["rev-parse", "HEAD"])?,
     };
     store.edit(repo, |project| {
@@ -686,7 +698,7 @@ fn land_folder(store: &Store, project: &Project, name: &str) -> Result<()> {
     sandfs(&["update", &copy.workspace])?;
     store.edit(&project.repo, |project| {
         let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
-        copy.base = now().to_string();
+        copy.base = folder_base();
         Ok(())
     })?;
     println!("{name}: {} written to {}", files(changed.len()), project.home.display());
@@ -757,6 +769,14 @@ fn mount_copy(copy: &Copy) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_bases_taken_in_one_second_differ() {
+        let (a, b) = (folder_base(), folder_base());
+        assert_ne!(a, b);
+        assert!(now() - copied_at(&a).unwrap() <= 1);
+        assert_eq!(copied_at("1700000000"), Some(1_700_000_000));
+    }
 
     #[test]
     fn times_are_told_in_the_largest_unit() {

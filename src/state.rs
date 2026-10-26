@@ -44,7 +44,7 @@ pub struct Copy {
     pub dir: PathBuf,
     pub workspace: String,
     /// The commit of the default branch the copy sits on; for a copy of a plain
-    /// folder, when the folder was copied, in seconds since the Unix epoch.
+    /// folder, when the folder was copied, as `SECONDS.NANOS` since the Unix epoch.
     pub base: String,
     /// The copy it was made from, if not the default branch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
