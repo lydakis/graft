@@ -1,6 +1,6 @@
 //! The programs Graft drives: `sandfs` for the files and `git` for reading commits.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -58,10 +58,18 @@ pub fn changes(name: &str, since: Option<&str>, dir: &Path) -> Result<Vec<Change
             _ => bail!("unexpected line from sandfs changes: {line:?}"),
         })
         .collect::<Result<Vec<_>>>()?;
-    // Only an added file can be one git ignores; the others are files of the base, which
-    // git tracks, and a deleted one may sit below a link that replaced its folder, which
-    // git refuses to look past.
-    let ignored = ignored(dir, all.iter().filter(|change| change.kind == 'A').map(|change| change.path.as_str()))?;
+    // A path below a link, as a deleted file is when a link replaced its folder, is no
+    // file git could ignore, and git refuses to look past the link.
+    let mut links = HashMap::new();
+    let mut below_link = |path: &str| {
+        Path::new(path).ancestors().skip(1).filter(|parent| !parent.as_os_str().is_empty()).any(|parent| {
+            *links.entry(parent.to_path_buf()).or_insert_with(|| {
+                std::fs::symlink_metadata(dir.join(parent)).is_ok_and(|meta| meta.file_type().is_symlink())
+            })
+        })
+    };
+    let asked: Vec<&str> = all.iter().map(|change| change.path.as_str()).filter(|path| !below_link(path)).collect();
+    let ignored = ignored(dir, asked.into_iter())?;
     Ok(all.into_iter().filter(|change| !ignored.contains(&change.path)).collect())
 }
 

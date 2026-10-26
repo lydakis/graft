@@ -247,10 +247,10 @@ fn copies_are_made_compared_synced_and_landed() {
     std::fs::write(fix.join("src/lib.rs"), "fn one() {}\n\nfn two() { 2 }\n").unwrap();
     std::fs::write(fix.join("notes.txt"), "why\n").unwrap();
     std::fs::write(try_.join("src/lib.rs"), "fn one() { 1 }\n\nfn two() {}\n").unwrap();
-    // Build output git ignores is no change, in either copy.
-    for copy in [&fix, &try_] {
+    // Build output git ignores is no change, in either copy or between them.
+    for (copy, built) in [(&fix, "built\n"), (&try_, "built another way\n")] {
         std::fs::create_dir_all(copy.join("target/debug")).unwrap();
-        std::fs::write(copy.join("target/debug/app"), "built\n").unwrap();
+        std::fs::write(copy.join("target/debug/app"), built).unwrap();
     }
     assert_eq!(gft.run(&fix, &["changes"]), "A notes.txt\nM src/lib.rs\n");
     assert_eq!(gft.run(&fix, &["changes", "fix", "try"]), "A notes.txt\nM src/lib.rs\n");
@@ -262,6 +262,13 @@ fn copies_are_made_compared_synced_and_landed() {
     assert_eq!(gft.run(&work, &["ls"]), listed);
     assert_eq!(gft.run(&work, &["ls"]).matches("(home, main)").count(), 1);
     assert_eq!(gft.run(&home, &["path", "fix"]), format!("{}\n", fix.display()));
+    // A folder replaced by a link: git isn't asked about what was in it, past the link.
+    gft.run(&home, &["new", "link"]);
+    let link = work.join("app+link");
+    std::fs::remove_dir_all(link.join("src")).unwrap();
+    std::os::unix::fs::symlink("elsewhere", link.join("src")).unwrap();
+    assert_eq!(gft.run(&link, &["changes"]), "A src\nD src/lib.rs\n");
+    gft.run(&home, &["rm", "link", "--force"]);
 
     // A snapshot, a wrong turn, and back.
     gft.run(&fix, &["save", "two returns 2"]);
