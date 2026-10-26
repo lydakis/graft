@@ -1,4 +1,4 @@
-//! Graft (`gft`): work in instant copies of a GitHub repository, or of a plain folder.
+//! Graft (`gft`): work in many fast copies of a GitHub repository, or of a plain folder.
 //!
 //! Every copy is a sandfs folder over a commit of the repository's default branch, so
 //! nothing is cloned and a copy costs what it changes. GitHub stays the place where
@@ -26,7 +26,11 @@ use crate::state::{Copy, Project, Snapshot, Store, check_copy_name};
 use crate::tools::{changes, copy_changes, ensure_mounted, fork, git, mount, mounted, path_str, sandfs, short};
 
 #[derive(Parser)]
-#[command(name = "gft", version, about = "Work in instant copies of a GitHub repository, built on sandfs")]
+#[command(
+    name = "gft",
+    version,
+    about = "Work in fast copies of a GitHub repository that share its files, built on sandfs"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -118,6 +122,10 @@ enum Cmd {
         /// whose changes this landing then undoes.
         #[arg(long)]
         force: bool,
+        /// Print what landing would do (the branch, the commit's parents, the pull
+        /// request and the files), changing nothing on GitHub or here.
+        #[arg(long, short = 'n')]
+        dry_run: bool,
     },
     /// Delete copies, with their snapshots. Their pull requests stay as they are.
     /// A copy with changes that never landed (no pull request, or files changed since
@@ -209,13 +217,13 @@ fn run(cli: Cli) -> Result<()> {
             let (project, current) = here(&store)?;
             sync(&store, &project.repo, &which(name, current)?)
         }
-        Cmd::Land { name, message, body, body_file, draft, force } => {
+        Cmd::Land { name, message, body, body_file, draft, force, dry_run } => {
             let (project, current) = here(&store)?;
             if project.folder {
-                if message.is_some() || body.is_some() || body_file.is_some() || draft || force {
+                if message.is_some() || body.is_some() || body_file.is_some() || draft || force || dry_run {
                     bail!(
-                        "a copy of a folder lands into the folder; --message, --body, --draft and --force are for \
-                         pull requests"
+                        "a copy of a folder lands into the folder; --message, --body, --draft, --force and \
+                         --dry-run are for pull requests"
                     );
                 }
                 return land_folder(&store, &project, &which(name, current)?);
@@ -224,7 +232,7 @@ fn run(cli: Cli) -> Result<()> {
                 Some(path) => Some(read_body(&path)?),
                 None => body,
             };
-            let options = land::Options { message: message.as_deref(), body: body.as_deref(), draft, force };
+            let options = land::Options { message: message.as_deref(), body: body.as_deref(), draft, force, dry_run };
             land::land(&store, &project.repo, &which(name, current)?, &options)
         }
         Cmd::Rm { names, force } => {

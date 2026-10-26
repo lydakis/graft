@@ -1,6 +1,6 @@
 # Graft
 
-Work in instant copies of a GitHub repository, or of a plain folder. Each copy is a [sandfs](https://github.com/lydakis/sandfs) folder over a commit of the default branch, so nothing is cloned, a copy appears in a fraction of a second, and it costs only what it changes. When a copy is good, `gft land` turns it into a branch and a pull request through GitHub's API, with no local commit and no push.
+Work in many copies of a GitHub repository, or of a plain folder, each made in a fraction of a second. Each copy is a [sandfs](https://github.com/lydakis/sandfs) folder over a commit of the default branch: the copies share one set of the repository's files, downloaded from GitHub as they are first read, and each copy keeps only what it changes. Nothing is cloned up front, so the first read of a file, and the first search or build across the whole tree, waits for those files to arrive; after that they are on disk and shared by every copy. When a copy is good, `gft land` turns it into a branch and a pull request through GitHub's API, with no local commit and no push.
 
 The command is `gft` (also installed as `graft`). For plain folders, see [Plain folders](#plain-folders).
 
@@ -47,14 +47,14 @@ gft rm --force agent-07b            # delete one anyway, losing those changes
 | `gft save [NOTE]` / `gft undo [N]` | Snapshot the copy; go back N snapshots (default 1). Both take `-c COPY`. |
 | `gft undo --list` | The copy's snapshots, newest first, each with its number for `undo N`, how long ago it was taken and its note. Changes nothing. |
 | `gft sync [NAME]` | Move the copy onto the newest commit, in place: programs working in the copy carry on. Files changed on both sides are merged line by line with `git merge-file`; conflicts are left marked in the file and listed. |
-| `gft land [NAME] [-m TITLE] [--body TEXT \| --body-file PATH] [--draft] [--force]` | Commit the copy's changes on branch `graft/NAME` on GitHub and open a pull request (against the copy it came from, if that one had landed when this copy was made). Landing again adds a commit, also when the copy was put back as its base has it, which empties the pull request. The description is TEXT or the contents of PATH (`-` reads standard input), followed by a line saying it was landed with `gft land`. Giving one when landing again replaces the description on the open pull request; giving none leaves it as it is. A landing cut short (a lost connection, GitHub refusing the pull request) is finished by landing again, without a second commit or pull request. If the branch on GitHub has commits the copy didn't land, `land` stops rather than undo them; `--force` lands anyway. |
+| `gft land [NAME] [-m TITLE] [--body TEXT \| --body-file PATH] [--draft] [--force] [--dry-run]` | Commit the copy's changes on branch `graft/NAME` on GitHub and open a pull request (against the copy it came from, if that one had landed when this copy was made). Landing again adds a commit, also when the copy was put back as its base has it, which empties the pull request. The description is TEXT or the contents of PATH (`-` reads standard input), followed by a line saying it was landed with `gft land`. Giving one when landing again replaces the description on the open pull request; giving none leaves it as it is. A landing cut short (a lost connection, GitHub refusing the pull request) is finished by landing again, without a second commit or pull request. If the branch on GitHub has commits the copy didn't land, `land` stops rather than undo them; `--force` lands anyway. `--dry-run` (`-n`) prints what landing would do (the branch, the commit's parents, the pull request and the files) and changes nothing. |
 | `gft rm [--force] NAME...` | Delete copies and their snapshots. Pull requests stay. A copy with changes that never landed (it never landed, or files changed since its last landing, put back as the base has them included) is kept, and the files that would be lost are counted, unless `--force` is given. |
 
 Commands that take a copy use the one the current folder is in when none is named.
 
 ## Many agents at once
 
-Give each agent its own copy, named for its task, and let each land its own pull request. Nothing is shared between copies, so one agent's half-finished edit never breaks another's build, and the copies cost almost nothing to make.
+Give each agent its own copy, named for its task, and let each land its own pull request. No change is shared between copies, so one agent's half-finished edit never breaks another's build, and a new copy takes no disk until it changes something.
 
 ```bash
 gft new fix-timeout add-retries docs-env   # one copy per agent, made together
@@ -125,6 +125,18 @@ sandfs is built into `gft`, so it needn't be installed.
 - `undo` back past a `sync` makes the copy again, unmounting it for a moment, so no program may be working inside it then (an agent's shell sitting in the folder counts). So does `rm`. Other undos, and `sync`, change the copy in place and need nothing stopped.
 - Landing uploads each changed file as one API call. A few hundred changed files take a while, and GitHub allows 5,000 calls an hour per token.
 - Repositories on GitHub (or a stand-in for its API), and plain folders. A folder that is a git repository is taken as a repository: `gft get OWNER/NAME`.
+
+## Git in a copy, and what `land` sends
+
+A copy is a git checkout as far as git can tell: `git status`, `diff`, `log`, `blame` and local commits work in it, and editors and build tools see an ordinary folder. `land` doesn't use git's commits, though. It reads the copy's files and sends them to GitHub as they are on disk, which draws a line around what git would otherwise do for you:
+
+- **Files go as their bytes.** A changed file is sent as it is on disk, without the repository's clean filters or line-ending conversion (`.gitattributes` `filter`, `text`, `eol`), as `git hash-object --no-filters` would see it. Files come into a copy the same way, as stored in the repository.
+- **Git LFS** files are their pointer files in a copy. A pointer left alone lands unchanged; a real file written in its place lands as a plain git file, not through LFS.
+- **No hooks run.** No local commit is made, so `pre-commit`, `commit-msg` and the like never run; run your checks before landing.
+- **Commits aren't signed.** The commits `land` makes through the API carry no signature, so a branch rule that requires signed commits refuses them.
+- **Local commits are ignored.** `land` sends what the files are now, in one commit per landing, with the message from `-m`; commits made with git inside the copy, and their messages, don't reach GitHub.
+- **Submodules** don't appear in a copy, and a copy's landing leaves them as they are.
+- Modes: files, executable files and symbolic links land as such.
 
 ## Configuration
 

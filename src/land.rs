@@ -32,6 +32,8 @@ pub struct Options<'a> {
     pub draft: bool,
     /// Land even over commits on the branch that the copy didn't land.
     pub force: bool,
+    /// Say what landing would do, changing nothing.
+    pub dry_run: bool,
 }
 
 pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<()> {
@@ -87,6 +89,22 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
     // same, while its branch is there: the branch should lose those changes too.
     if changed.is_empty() && (copy.landed.is_none() || head.is_none()) {
         bail!("{name} has no changes to land");
+    }
+    // The first parent, and the base commit it was made on, when known.
+    let (first, first_on) = match (&head, &copy.stacked) {
+        // Over someone else's commits (with --force): made on what it last landed on, if anything.
+        (Some(head), _) => (head.clone(), ours.or(copy.landed.as_ref()).map(|landed| landed.on.clone())),
+        (None, Some(stacked)) => (stacked.commit.clone(), Some(stacked.on.clone())),
+        (None, None) => (copy.base.clone(), Some(copy.base.clone())),
+    };
+    let mut parents = vec![first];
+    // Made on a newer base than that parent: the base joins in.
+    if first_on.as_ref() != Some(&copy.base) {
+        parents.push(copy.base.clone());
+    }
+    if options.dry_run {
+        let pr = copy.pr.as_ref().filter(|_| head.is_some());
+        return preview(name, &branch, &pr_base, head.as_deref(), &parents, pr, &changed, ours.is_none());
     }
     // The description is kept in step with the one given, and always ends with where
     // the pull request came from.
@@ -144,18 +162,6 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
             commit
         }
         None => {
-            // The first parent, and the base commit it was made on, when known.
-            let (first, first_on) = match (&head, &copy.stacked) {
-                // Over someone else's commits (with --force): made on what it last landed on, if anything.
-                (Some(head), _) => (head.clone(), ours.or(copy.landed.as_ref()).map(|landed| landed.on.clone())),
-                (None, Some(stacked)) => (stacked.commit.clone(), Some(stacked.on.clone())),
-                (None, None) => (copy.base.clone(), Some(copy.base.clone())),
-            };
-            let mut parents = vec![first];
-            // Made on a newer base than that parent: the base joins in.
-            if first_on.as_ref() != Some(&copy.base) {
-                parents.push(copy.base.clone());
-            }
             let commit_message = match (options.message, &head) {
                 (Some(message), _) => message.to_owned(),
                 (None, None) => format!("Changes from {name}"),
@@ -227,6 +233,38 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
     let url = pr.url.clone();
     record(store, repo, name, |copy| copy.pr = Some(pr))?;
     println!("{branch} at {}, {}: {url}", short(&commit), crate::files(changed.len()));
+    Ok(())
+}
+
+/// What landing would publish: the branch and where it moves from, the commit's
+/// parents, the pull request, and the files.
+#[allow(clippy::too_many_arguments)]
+fn preview(
+    name: &str,
+    branch: &str,
+    pr_base: &str,
+    head: Option<&str>,
+    parents: &[String],
+    pr: Option<&Pr>,
+    changed: &[crate::tools::Change],
+    replaces: bool,
+) -> Result<()> {
+    let moves = match head {
+        None => "made new".to_owned(),
+        Some(head) if replaces => format!("moved from {}, replacing commits {name} didn't land", short(head)),
+        Some(head) => format!("moved from {}", short(head)),
+    };
+    let parents: Vec<&str> = parents.iter().map(|parent| short(parent)).collect();
+    println!("branch        {branch} ({moves})");
+    println!("commit        on {}", parents.join(" and "));
+    match pr {
+        Some(pr) => println!("pull request  {} (updated)", pr.url),
+        None => println!("pull request  new or open one, against {pr_base}"),
+    }
+    println!("files         {}", crate::files(changed.len()));
+    for change in changed {
+        println!("{} {}", change.kind, change.path);
+    }
     Ok(())
 }
 

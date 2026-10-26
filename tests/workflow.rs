@@ -546,6 +546,18 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
         std::fs::write(at(name).join("notes.txt"), format!("{name}\n")).unwrap();
     }
 
+    // A dry run says what landing would do, and does none of it.
+    let plan = gft.run(&at("fix"), &["land", "--dry-run"]);
+    assert_eq!(
+        plan,
+        format!(
+            "branch        graft/fix (made new)\ncommit        on {}\npull request  new or open one, against main\n\
+             files         1 file\nA notes.txt\n",
+            &first[..10]
+        )
+    );
+    assert!(made.lock().unwrap().commits.is_empty() && made.lock().unwrap().refs.is_empty());
+
     // The branch moves but GitHub's answer is lost: landing again sees its own commit
     // there and goes on to the pull request, without a second commit.
     made.lock().unwrap().lose_ref = true;
@@ -616,6 +628,8 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
         made.refs.insert("heads/graft/fix".into(), "pushed".into());
     }
     std::fs::write(at("fix").join("notes.txt"), "fix, and more\n").unwrap();
+    let plan = gft.run(&at("fix"), &["land", "--force", "--dry-run"]);
+    assert!(plan.contains("(moved from pushed, replacing commits fix didn't land)"), "{plan}");
     assert_eq!(made.lock().unwrap().refs["heads/graft/fix"], "pushed");
     gft.run(&at("fix"), &["land", "--force"]);
     let forced = made.lock().unwrap().refs["heads/graft/fix"].clone();
@@ -628,6 +642,9 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
     gft.run(&at("fix"), &["land"]);
     assert_ne!(made.lock().unwrap().refs["heads/graft/fix"], forced);
     std::fs::write(at("child").join("child.txt"), "on top\n").unwrap();
+    let plan = gft.run(&at("child"), &["land", "-n"]);
+    assert!(plan.contains(&format!("commit        on {}\n", &forced[..10.min(forced.len())])), "{plan}");
+    assert!(plan.contains("against graft/fix\n"), "{plan}");
     gft.run(&at("child"), &["land"]);
     {
         let made = made.lock().unwrap();
