@@ -642,6 +642,14 @@ fn copies_of_a_plain_folder_land_back_into_it() {
     assert!(synced.contains("kept yours\ttodo.md"), "{synced}");
     assert_eq!(std::fs::read_to_string(outside.path().join("target.md")).unwrap(), "outside\n");
     gft.run(&folder, &["rm", "--force", "linked"]);
+    // Nor is a link the folder had read through for the bytes it once held.
+    std::os::unix::fs::symlink("/dev/zero", folder.join("zero")).unwrap();
+    gft.run(&folder, &["new", "zeroed"]);
+    let zeroed = folder.parent().unwrap().join("notes+zeroed");
+    std::fs::remove_file(zeroed.join("zero")).unwrap();
+    assert!(gft.run(&zeroed, &["sync"]).contains("0 files changed on both sides"));
+    gft.run(&folder, &["rm", "--force", "zeroed"]);
+    std::fs::remove_file(folder.join("zero")).unwrap();
 
     // A folder inside another one can be a project of its own; inside it, it wins
     // (named to come after the outer one, which is looked at first).
@@ -1008,6 +1016,13 @@ fn closed_and_merged_pull_requests_take_no_more_commits() {
     let removed = gft.run(&home, &["rm", "--delete-branch", "closed", "merged"]);
     assert!(removed.contains("closed: deleted branch graft/closed-2"), "{removed}");
     assert!(removed.contains("merged: kept branch graft/merged-2: pull request #4 is still open"), "{removed}");
+    // A landing cut off before it heard of its pull request still keeps that branch.
+    gft.run(&home, &["new", "lost"]);
+    std::fs::write(at("lost").join("lost.txt"), "lost\n").unwrap();
+    made.lock().unwrap().lose_pull = true;
+    assert!(!gft.try_run(&at("lost"), &["land"]).status.success());
+    let removed = gft.run(&home, &["rm", "--delete-branch", "lost"]);
+    assert!(removed.contains("lost: kept branch graft/lost: pull request #5 is still open"), "{removed}");
     let made = made.lock().unwrap();
     assert!(!made.refs.contains_key("heads/graft/closed-2"));
     assert!(made.refs.contains_key("heads/graft/merged-2"));
@@ -1286,7 +1301,9 @@ fn copies_come_back_and_follow_upstream() {
     std::fs::write(home.join("home.txt"), "made at home\n").unwrap();
     let status = gft.run(&home, &["status"]);
     assert!(status.contains("changed    1 file here, which new copies don't have"), "{status}");
-    gft.run(&home, &["new", "h", "--from", "app"]);
+    // Copied from another copy while the home copy is unmounted, it mounts again.
+    sandfs.unmount("n").unwrap();
+    gft.run(&at("a"), &["new", "h", "--from", "app"]);
     assert_eq!(std::fs::read_to_string(at("h").join("home.txt")).unwrap(), "made at home\n");
     let newest = commit_upstream(repo, "later.txt", "later\n");
     assert!(gft.run(&home, &["sync"]).contains("app moved from"));

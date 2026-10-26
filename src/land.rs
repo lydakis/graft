@@ -436,11 +436,15 @@ pub fn delete_branch(repo: &str, copy: &crate::state::Copy) -> Result<String> {
     let Some(landed) = &copy.landed else { return Ok("never landed, so no branch".to_owned()) };
     let branch = &landed.branch;
     let github = GitHub::new(repo)?;
-    if let Some(pr) = &copy.pr {
-        let pull = github.call("GET", &format!("pulls/{}", pr.number), None)?;
-        if pull["state"] == "open" {
-            return Ok(format!("kept branch {branch}: pull request #{} is still open", pr.number));
+    // A landing cut off before it heard back may have opened one it didn't record.
+    let open = match &copy.pr {
+        Some(pr) => {
+            (github.call("GET", &format!("pulls/{}", pr.number), None)?["state"] == "open").then_some(pr.number)
         }
+        None => open_pr(&github, repo, branch)?.map(|pr| pr.number),
+    };
+    if let Some(number) = open {
+        return Ok(format!("kept branch {branch}: pull request #{number} is still open"));
     }
     match head_of(&github, branch)? {
         None => Ok(format!("branch {branch} is gone already")),

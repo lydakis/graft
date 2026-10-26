@@ -784,7 +784,10 @@ fn new(store: &Store, names: &[String], from: Option<(&str, bool)>) -> Result<()
             }
             match project.folder || project.checkout {
                 true => (project.source.clone(), None),
-                false => (project.workspace.clone(), Some(git(&project.home, &["rev-parse", "HEAD"])?)),
+                false => {
+                    ensure_mounted(&project.workspace, &project.home)?;
+                    (project.workspace.clone(), Some(git(&project.home, &["rev-parse", "HEAD"])?))
+                }
             }
         }
         Some((name, on)) => {
@@ -967,7 +970,7 @@ fn same_file(a: &Path, b: &Path, path: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
     let read = |dir: &Path| -> Option<(char, Vec<u8>)> {
         let full = dir.join(path);
-        let meta = std::fs::symlink_metadata(&full).ok()?;
+        let meta = entry(dir, path)?;
         if meta.file_type().is_symlink() {
             return Some(('l', std::fs::read_link(&full).ok()?.into_os_string().into_encoded_bytes()));
         }
@@ -1187,7 +1190,7 @@ fn diff(project: &Project, copy: &Copy) -> Result<()> {
         for change in &changed {
             let old = taken.join(&change.path);
             // A link counts as there even when what it points at isn't.
-            let there = std::fs::symlink_metadata(&old).is_ok();
+            let there = entry(&taken, &change.path).is_some();
             let old = if there { path_str(&old)?.to_owned() } else { "/dev/null".to_owned() };
             let new = if change.kind == 'D' { "/dev/null".to_owned() } else { change.path.clone() };
             show_diff(&copy.dir, &["--no-index", "--", &old, &new])?;
@@ -1239,7 +1242,7 @@ fn between(a: (&str, &Path), b: (&str, &Path)) -> Result<Vec<tools::Change>> {
         let listed = listed.split(|&byte| byte == 0).filter(|path| !path.is_empty());
         paths.extend(listed.map(|path| String::from_utf8_lossy(path).into_owned()));
     }
-    let is_file = |dir: &Path, path: &str| std::fs::symlink_metadata(dir.join(path)).is_ok_and(|meta| !meta.is_dir());
+    let is_file = |dir: &Path, path: &str| entry(dir, path).is_some_and(|meta| !meta.is_dir());
     Ok(paths
         .into_iter()
         .filter(|path| !same_file(a.1, b.1, path))
@@ -1306,9 +1309,29 @@ fn marked(copy: &Copy, everywhere: bool) -> Result<BTreeSet<String>> {
     Ok(markers_in(&copy.dir, &paths))
 }
 
-/// Whether `path` is a regular file, not a link to one.
-fn regular(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+/// Whether something other than a folder, such as a link, stands above `path` in
+/// the folder `dir`, so that `path` there would reach out of it.
+fn under_link(dir: &Path, path: &str) -> bool {
+    let mut at = dir.to_path_buf();
+    let parents = Path::new(path).parent().into_iter().flat_map(Path::components);
+    parents.into_iter().any(|part| {
+        at.push(part);
+        std::fs::symlink_metadata(&at).is_ok_and(|meta| !meta.is_dir())
+    })
+}
+
+/// What is at `path` in the folder `dir`, without following a link there or above
+/// it: none for nothing, or for a path under a link.
+fn entry(dir: &Path, path: &str) -> Option<std::fs::Metadata> {
+    if under_link(dir, path) {
+        return None;
+    }
+    std::fs::symlink_metadata(dir.join(path)).ok()
+}
+
+/// Whether `path` in the folder `dir` is a regular file, not a link to one nor under one.
+fn regular(dir: &Path, path: &str) -> bool {
+    entry(dir, path).is_some_and(|meta| meta.is_file())
 }
 
 /// Which of `paths` in the folder `dir` have Graft's conflict markers.
@@ -1316,11 +1339,10 @@ fn markers_in(dir: &Path, paths: &BTreeSet<String>) -> BTreeSet<String> {
     let mut marked = BTreeSet::new();
     for path in paths {
         // Only a file's own bytes land: a link lands as where it points, unread.
-        let file = dir.join(path);
-        if !regular(&file) {
+        if !regular(dir, path) {
             continue;
         }
-        let Ok(data) = std::fs::read(file) else { continue };
+        let Ok(data) = std::fs::read(dir.join(path)) else { continue };
         let lines = data.split(|&byte| byte == b'\n');
         if lines.into_iter().any(|line| line.starts_with(b"<<<<<<< yours") || line.starts_with(b">>>>>>> upstream")) {
             marked.insert(path.clone());
@@ -1457,12 +1479,15 @@ fn sync_saved(store: &Store, project: &Project, copy: &Copy, name: &str, merged:
     let (conflicts, looks) = take_in(both, &renames, |path, renamed| {
         Ok(match (project.folder, merged) {
             // From the folder as the copy took it, kept before it moved.
-            (true, _) => match (&folder_bases, std::fs::read(project.home.join(path))) {
-                // Only files: a link's target is no text to merge, nor a place to write.
-                (Some(bases), Ok(theirs)) if regular(&copy.dir.join(path)) && regular(&project.home.join(path)) => {
+            // Only files: a link's target is no text to merge, nor a place to write.
+            (true, _) => match &folder_bases {
+                Some(bases) if regular(&copy.dir, path) && regular(&project.home, path) => {
+                    let theirs = std::fs::read(project.home.join(path))?;
                     merge_bytes(&copy.dir, path, path, bases.get(path).cloned().flatten(), theirs)?
                 }
-                (_, Err(_)) => "deleted in the folder, changed here; kept yours".to_owned(),
+                _ if entry(&project.home, path).is_none() => {
+                    "deleted in the folder, changed here; kept yours".to_owned()
+                }
                 _ => "changed in the folder too; kept yours".to_owned(),
             },
             (false, Some(merged)) => {
@@ -1518,7 +1543,9 @@ fn folder_bases(copy: &Copy) -> Result<Option<BTreeMap<String, Option<Vec<u8>>>>
     let Ok(taken) = taken_folder(copy) else { return Ok(None) };
     let mut bases = BTreeMap::new();
     for change in changes(&copy.workspace, None, &copy.dir)? {
-        bases.insert(change.path.clone(), std::fs::read(taken.join(&change.path)).ok());
+        // Only a file's bytes: reading through a link could take anything, or forever.
+        let data = regular(&taken, &change.path).then(|| std::fs::read(taken.join(&change.path)).ok()).flatten();
+        bases.insert(change.path.clone(), data);
     }
     Ok(Some(bases))
 }
@@ -1642,17 +1669,16 @@ fn sync_home(project: &Project) -> Result<usize> {
 /// leaving conflict markers where both changed the same lines. A file upstream
 /// renamed to `renamed` is merged there, and leaves its old name. Says what happened.
 fn merge(dir: &Path, base: Option<Vec<u8>>, new: &str, path: &str, renamed: Option<&str>) -> Result<String> {
-    let mine = dir.join(path);
-    let meta = std::fs::symlink_metadata(&mine);
-    if !meta.as_ref().is_ok_and(|meta| meta.is_file()) {
-        let said = if meta.is_err() { "deleted here, changed upstream; kept deleted" } else { "kept yours" };
+    let meta = entry(dir, path);
+    if !meta.as_ref().is_some_and(|meta| meta.is_file()) {
+        let said = if meta.is_none() { "deleted here, changed upstream; kept deleted" } else { "kept yours" };
         return Ok(said.to_owned());
     }
     let show = |at: &str| tools::git_raw(dir, &["show", &format!("{new}:{at}")]).ok();
     let (target, theirs) = match (show(path), renamed) {
         (Some(theirs), _) => (path, theirs),
         // Only into a file, or nothing yet: never through a link or into a folder.
-        (None, Some(to)) if std::fs::symlink_metadata(dir.join(to)).is_ok_and(|meta| !meta.is_file()) => {
+        (None, Some(to)) if under_link(dir, to) || entry(dir, to).is_some_and(|meta| !meta.is_file()) => {
             return Ok(format!("renamed upstream to {to}, which isn't a file here; kept yours"));
         }
         (None, Some(to)) => match show(to) {
@@ -1796,6 +1822,20 @@ mod tests {
                 .collect::<String>();
             assert_eq!(merged, expected, "{count} conflicts");
         }
+    }
+
+    #[test]
+    fn nothing_under_a_link_counts_as_there() {
+        let (a, b, outside) =
+            (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        std::fs::write(outside.path().join("file.txt"), "same\n").unwrap();
+        std::fs::create_dir(b.path().join("src")).unwrap();
+        std::fs::write(b.path().join("src/file.txt"), "same\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), a.path().join("src")).unwrap();
+        assert!(under_link(a.path(), "src/file.txt") && !under_link(b.path(), "src/file.txt"));
+        assert!(entry(a.path(), "src/file.txt").is_none() && entry(a.path(), "src").is_some());
+        assert!(!regular(a.path(), "src/file.txt") && regular(b.path(), "src/file.txt"));
+        assert!(!same_file(a.path(), b.path(), "src/file.txt"));
     }
 
     #[test]
