@@ -35,3 +35,20 @@ jobs:
         env:
           GRAFT_REQUIRE_MOUNT: "1"
           TMPDIR: /mnt/clones
+
+  # macOS mounts over NFS to localhost, which the runner allows without setup; its
+  # APFS disk clones files, so the plain-folder test runs too.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Run tests
+        run: cargo test
+        env:
+          GRAFT_REQUIRE_MOUNT: "1"

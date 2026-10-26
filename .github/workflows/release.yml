@@ -1,0 +1,76 @@
+name: Release
+
+# Every pull request builds the downloads, so a break shows up before a release. A
+# pushed `v*` tag attaches them to the tag's GitHub release, making it if needed.
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # musl, so the Linux builds are static and run on any distribution.
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          name="graft-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/gft" "target/${{ matrix.target }}/release/graft" LICENSE README.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+      # Run it where the runner can: every target but the Intel Mac build.
+      - if: matrix.target != 'x86_64-apple-darwin'
+        name: Smoke-test the command
+        run: |
+          "graft-${{ matrix.target }}/gft" --version
+          "graft-${{ matrix.target }}/graft" --help > /dev/null
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: graft-${{ matrix.target }}
+          path: graft-${{ matrix.target }}.tar.gz
+
+  github-release:
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: graft-*
+          path: dist
+          merge-multiple: true
+      - name: Attach the downloads to the release
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "graft") | .version')" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the Cargo.toml version"
+            exit 1
+          fi
+          if ! gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "Graft $version" --generate-notes
+          fi
+          (cd dist && shasum -a 256 *.tar.gz > SHA256SUMS)
+          gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --clobber

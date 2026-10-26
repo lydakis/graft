@@ -100,9 +100,23 @@ gft rm cleanup
 - **`sync` has nothing to merge from**: a folder keeps no older versions, so a file changed both in the copy and in the folder keeps the copy's version and is listed.
 - `save`, `undo`, `ls`, `changes` and `rm` work as for a repository. `land` takes no `-m`, `--body` or `--draft`.
 
+## Install
+
+Each [release](https://github.com/lydakis/graft/releases) has `gft` (and `graft`) for macOS (Apple silicon, Intel) and Linux (x86_64, aarch64; static, any distribution). On an Apple silicon Mac:
+
+```bash
+curl -L https://github.com/lydakis/graft/releases/latest/download/graft-aarch64-apple-darwin.tar.gz | tar xz
+mv graft-aarch64-apple-darwin/gft graft-aarch64-apple-darwin/graft ~/.local/bin/   # or any folder on your PATH
+rm -r graft-aarch64-apple-darwin
+```
+
+Other machines: `graft-x86_64-apple-darwin`, `graft-x86_64-unknown-linux-musl`, `graft-aarch64-unknown-linux-musl`. From source: `cargo install --locked --git https://github.com/lydakis/graft`.
+
+sandfs is built into `gft`, so it needn't be installed.
+
 ## Needs
 
-- What a mount needs: FUSE 3 on Linux, nothing on macOS. sandfs is built into `gft`, so it needn't be installed. Install Graft with `cargo install --git https://github.com/lydakis/graft`.
+- What a mount needs: FUSE 3 on Linux, nothing on macOS.
 - `git` and `curl`.
 - A GitHub token for `land`: `GITHUB_TOKEN` or `GH_TOKEN`, else whatever `gh auth token` gives (see [Configuration](#configuration)).
 
