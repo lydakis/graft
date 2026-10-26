@@ -1275,6 +1275,12 @@ fn copies_come_back_and_follow_upstream() {
     assert_eq!(c["overlaps"], json!({}), "{listed}");
     std::fs::write(at("c").join("notes.txt"), "noted differently\n").unwrap();
     assert!(gft.run(&home, &["ls"]).contains("overlaps a on notes.txt"));
+    // Unmounted, their files can't be compared, so the overlap stands.
+    sandfs.unmount("n.a").unwrap();
+    sandfs.unmount("n.c").unwrap();
+    let listed = gft.run(&home, &["ls"]);
+    assert!(listed.contains("overlaps a on GUIDE.md and 1 more"), "{listed}");
+    gft.run(&home, &["up"]);
 
     // Work done in the home copy shows, can be copied, and the home syncs too.
     std::fs::write(home.join("home.txt"), "made at home\n").unwrap();

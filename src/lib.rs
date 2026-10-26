@@ -249,6 +249,7 @@ fn run(cli: Cli) -> Result<()> {
                 match name.or(current.clone()) {
                     Some(name) => {
                         let copy = copy(&project, &name)?;
+                        mount_copy(copy)?;
                         Ok((copy.workspace.clone(), copy.dir.clone()))
                     }
                     None if project.folder => bail!("name a copy: the folder itself is what copies change"),
@@ -931,10 +932,12 @@ fn list(project: &Project, print: bool) -> Result<serde_json::Value> {
                 continue;
             }
             // The same bytes in both, as a copy made from another has until it
-            // changes them, is no clash.
+            // changes them, is no clash. Only mounted copies show their bytes.
+            let other_copy = &project.copies[*other];
+            let both_up = up && mounted.contains(&other_copy.workspace);
             let shared: Vec<&String> = mine
                 .intersection(theirs)
-                .filter(|path| !same_file(&copy.dir, &project.copies[*other].dir, path))
+                .filter(|path| !(both_up && same_file(&copy.dir, &other_copy.dir, path)))
                 .collect();
             if let Some(first) = shared.first() {
                 let more = if shared.len() > 1 { format!(" and {} more", shared.len() - 1) } else { String::new() };
@@ -1183,7 +1186,9 @@ fn diff(project: &Project, copy: &Copy) -> Result<()> {
         let taken = taken_folder(copy)?;
         for change in &changed {
             let old = taken.join(&change.path);
-            let old = if old.exists() { path_str(&old)?.to_owned() } else { "/dev/null".to_owned() };
+            // A link counts as there even when what it points at isn't.
+            let there = std::fs::symlink_metadata(&old).is_ok();
+            let old = if there { path_str(&old)?.to_owned() } else { "/dev/null".to_owned() };
             let new = if change.kind == 'D' { "/dev/null".to_owned() } else { change.path.clone() };
             show_diff(&copy.dir, &["--no-index", "--", &old, &new])?;
         }
@@ -1472,6 +1477,17 @@ fn sync_saved(store: &Store, project: &Project, copy: &Copy, name: &str, merged:
     })?;
     store.edit(repo, |project| {
         let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
+        // Markers left by an earlier sync move with a file upstream renamed.
+        let moved: Vec<(String, String)> = copy
+            .conflicts
+            .iter()
+            .filter_map(|old| renames.get(old).map(|new| (old.clone(), new.clone())))
+            .filter(|(old, _)| std::fs::symlink_metadata(copy.dir.join(old)).is_err())
+            .collect();
+        for (old, new) in moved {
+            copy.conflicts.remove(&old);
+            copy.conflicts.insert(new);
+        }
         copy.conflicts.extend(conflicts.iter().cloned());
         if let Some(merged) = merged {
             // That work is the default branch's now: the copy stands on that alone,
@@ -1635,6 +1651,10 @@ fn merge(dir: &Path, base: Option<Vec<u8>>, new: &str, path: &str, renamed: Opti
     let show = |at: &str| tools::git_raw(dir, &["show", &format!("{new}:{at}")]).ok();
     let (target, theirs) = match (show(path), renamed) {
         (Some(theirs), _) => (path, theirs),
+        // Only into a file, or nothing yet: never through a link or into a folder.
+        (None, Some(to)) if std::fs::symlink_metadata(dir.join(to)).is_ok_and(|meta| !meta.is_file()) => {
+            return Ok(format!("renamed upstream to {to}, which isn't a file here; kept yours"));
+        }
         (None, Some(to)) => match show(to) {
             Some(theirs) => (to, theirs),
             None => return Ok("deleted upstream, changed here; kept yours".to_owned()),
