@@ -54,6 +54,70 @@ struct Made {
     fail_pull: bool,
     /// Make the next pull request but answer with a failure.
     lose_pull: bool,
+    /// The repository the stand-in serves, for what GitHub reads from commits.
+    repo: Option<std::path::PathBuf>,
+    /// Trees and blobs made, by id.
+    tree_ids: BTreeMap<String, Value>,
+    blob_ids: BTreeMap<String, Vec<u8>>,
+    /// Pull requests moved to another base, as `(N, base)`.
+    retargets: Vec<(u64, String)>,
+}
+
+/// The bytes of `path` in the tree `tree`: one made by landing, else a commit's of
+/// the repository, `tree-of-COMMIT`.
+fn file_in(made: &Made, tree: &str, path: &str) -> Option<Vec<u8>> {
+    if let Some(commit) = tree.strip_prefix("tree-of-") {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(made.repo.as_ref()?)
+            .args(["show", &format!("{commit}:{path}")])
+            .output()
+            .ok()?;
+        return out.status.success().then_some(out.stdout);
+    }
+    let body = made.tree_ids.get(tree)?;
+    match body["tree"].as_array()?.iter().find(|entry| entry["path"] == path) {
+        Some(entry) => made.blob_ids.get(entry["sha"].as_str()?).cloned(),
+        None => file_in(made, body["base_tree"].as_str()?, path),
+    }
+}
+
+/// A pull request as GitHub answers for it.
+fn pull_json(made: &Made, n: usize) -> Value {
+    let pull = &made.pulls[n - 1];
+    json!({"number": n, "html_url": format!("https://github.com/o/n/pull/{n}"),
+        "state": pull.get("state").cloned().unwrap_or(json!("open")),
+        "merged_at": pull.get("merged_at").cloned().unwrap_or(Value::Null),
+        "merge_commit_sha": pull.get("merge_commit_sha").cloned().unwrap_or(Value::Null),
+        "head": {"ref": pull["head"], "sha": pull.get("head_sha").cloned().unwrap_or(Value::Null)},
+        "base": {"ref": pull["base"]}})
+}
+
+/// Keep the last commit of the branch `branch` with each pull request from it.
+fn track_heads(made: &mut Made, branch: &str, sha: &str) {
+    for pull in made.pulls.iter_mut().filter(|pull| pull["head"] == branch) {
+        pull["head_sha"] = json!(sha);
+    }
+}
+
+/// Whether `to` has `from` in its history: through the commits landing made, then
+/// the repository's.
+fn is_ancestor(made: &Made, from: &str, to: &str) -> bool {
+    if from == to {
+        return true;
+    }
+    if let Some(commit) = made.commits.iter().find(|commit| commit["sha"] == to) {
+        let parents = commit["parents"].as_array().cloned().unwrap_or_default();
+        return parents.iter().any(|parent| is_ancestor(made, from, parent.as_str().unwrap_or_default()));
+    }
+    Command::new("git")
+        .arg("-C")
+        .arg(made.repo.as_ref().unwrap())
+        .args(["merge-base", "--is-ancestor", from, to])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
 }
 
 /// Answers the calls `gft land` makes, keeping what it was sent.
@@ -106,16 +170,20 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
                     use std::hash::{Hash, Hasher};
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
                     data.hash(&mut hasher);
+                    let sha = format!("blob-{:x}", hasher.finish());
+                    made.blob_ids.insert(sha.clone(), data.clone());
                     made.blobs.push(data);
-                    (201, json!({"sha": format!("blob-{:x}", hasher.finish())}))
+                    (201, json!({"sha": sha}))
                 }
                 ("POST", "git/trees") => {
                     // Named by contents, as git names trees.
                     use std::hash::{Hash, Hasher};
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
                     body.to_string().hash(&mut hasher);
+                    let sha = format!("tree-{:x}", hasher.finish());
+                    made.tree_ids.insert(sha.clone(), body.clone());
                     made.trees.push(body);
-                    (201, json!({"sha": format!("tree-{:x}", hasher.finish())}))
+                    (201, json!({"sha": sha}))
                 }
                 ("POST", "git/commits") => {
                     let sha = format!("commit-{}", made.commits.len() + 1);
@@ -133,7 +201,9 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
                 }
                 ("POST", "git/refs") => {
                     let name = body["ref"].as_str().unwrap().trim_start_matches("refs/").to_owned();
-                    made.refs.insert(name, body["sha"].as_str().unwrap().to_owned());
+                    let sha = body["sha"].as_str().unwrap().to_owned();
+                    track_heads(&mut made, name.trim_start_matches("heads/"), &sha);
+                    made.refs.insert(name, sha);
                     if std::mem::take(&mut made.lose_ref) {
                         (502, json!({"message": "cut short"}))
                     } else {
@@ -141,7 +211,9 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
                     }
                 }
                 ("PATCH", p) if p.starts_with("git/refs/") => {
-                    made.refs.insert(p["git/refs/".len()..].to_owned(), body["sha"].as_str().unwrap().to_owned());
+                    let sha = body["sha"].as_str().unwrap().to_owned();
+                    track_heads(&mut made, p["git/refs/heads/".len()..].trim_end(), &sha);
+                    made.refs.insert(p["git/refs/".len()..].to_owned(), sha);
                     if std::mem::take(&mut made.lose_ref) {
                         (502, json!({"message": "cut short"}))
                     } else {
@@ -149,15 +221,50 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
                     }
                 }
                 ("GET", p) if p.starts_with("pulls?head=o:") => {
-                    let branch = p["pulls?head=o:".len()..].split('&').next().unwrap();
-                    let open: Vec<Value> = (1..=made.pulls.len())
+                    let mut query = p["pulls?head=o:".len()..].split('&');
+                    let branch = query.next().unwrap();
+                    let state = query.find_map(|part| part.strip_prefix("state=")).unwrap_or("open");
+                    let found: Vec<Value> = (1..=made.pulls.len())
                         .filter(|n| made.pulls[n - 1]["head"] == branch)
-                        .map(|n| json!({"number": n, "html_url": format!("https://github.com/o/n/pull/{n}")}))
+                        .map(|n| pull_json(&made, n))
+                        .filter(|pull| state == "all" || pull["state"] == state)
                         .collect();
-                    (200, json!(open))
+                    (200, json!(found))
+                }
+                ("GET", p) if p.starts_with("pulls/") => {
+                    let n: usize = p["pulls/".len()..].parse().unwrap();
+                    (200, pull_json(&made, n))
+                }
+                ("GET", p) if p.starts_with("compare/") => {
+                    let (from, to) = p["compare/".len()..].split_once("...").unwrap();
+                    let ancestor = is_ancestor(&made, from, to);
+                    let status = match (from == to, ancestor) {
+                        (true, _) => "identical",
+                        (false, true) => "ahead",
+                        (false, false) => "diverged",
+                    };
+                    (200, json!({"status": status}))
+                }
+                ("GET", p) if p.starts_with("contents/") => {
+                    let (path, commit) = p["contents/".len()..].split_once("?ref=").unwrap();
+                    let tree = made
+                        .commits
+                        .iter()
+                        .find(|c| c["sha"] == commit)
+                        .map_or(format!("tree-of-{commit}"), |c| c["tree"].as_str().unwrap().to_owned());
+                    match file_in(&made, &tree, path) {
+                        Some(data) => {
+                            use base64::Engine;
+                            let content = base64::engine::general_purpose::STANDARD.encode(data);
+                            (200, json!({"type": "file", "content": content, "sha": "unused"}))
+                        }
+                        None => (404, json!({"message": "Not Found"})),
+                    }
                 }
                 ("POST", "pulls") if std::mem::take(&mut made.fail_pull) => (502, json!({"message": "cut short"})),
                 ("POST", "pulls") => {
+                    let mut body = body;
+                    body["head_sha"] = json!(made.refs.get(&format!("heads/{}", body["head"].as_str().unwrap())));
                     made.pulls.push(body);
                     let n = made.pulls.len();
                     match std::mem::take(&mut made.lose_pull) {
@@ -167,7 +274,13 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
                 }
                 ("PATCH", p) if p.starts_with("pulls/") => {
                     let number: u64 = p["pulls/".len()..].parse().unwrap();
-                    made.patches.push((number, body["body"].clone()));
+                    if let Some(base) = body["base"].as_str() {
+                        made.pulls[number as usize - 1]["base"] = json!(base);
+                        made.retargets.push((number, base.to_owned()));
+                    }
+                    if !body["body"].is_null() {
+                        made.patches.push((number, body["body"].clone()));
+                    }
                     (200, json!({"number": number}))
                 }
                 _ => (404, json!({"message": format!("no {method} {path}")})),
@@ -322,10 +435,12 @@ fn copies_are_made_compared_synced_and_landed() {
     shell.kill().unwrap();
     shell.wait().unwrap();
     gft.run(&fix, &["save", "again"]);
+    // Undo kept the wrong turn too, as a snapshot of its own.
     let listed = gft.run(&home, &["undo", "--list", "--copy", "fix"]);
     let lines: Vec<&str> = listed.lines().collect();
-    assert!(lines.len() == 2 && lines[0].starts_with("1\t") && lines[1].starts_with("2\t"), "{listed}");
-    assert!(lines[0].ends_with(" sec ago\tagain") && lines[1].ends_with(" sec ago\ttwo returns 2"), "{listed}");
+    assert!(lines.len() == 3 && lines[0].starts_with("1\t") && lines[2].starts_with("3\t"), "{listed}");
+    assert!(lines[0].ends_with(" sec ago\tagain") && lines[1].ends_with(" sec ago\tbefore undo"), "{listed}");
+    assert!(lines[2].ends_with(" sec ago\ttwo returns 2"), "{listed}");
     gft.run(&home, &["undo", "--copy", "fix"]);
 
     // Upstream changes another line of the same file: sync merges it in.
@@ -599,11 +714,17 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
         assert_eq!(made.commits.len(), 5);
     }
     // A branch of that name that this copy never landed is someone else's, even with
-    // the same files.
+    // the same files, or an earlier copy's of the same name: a first landing takes a
+    // name of its own and none of that branch's history.
     made.lock().unwrap().refs.insert("heads/graft/taken".into(), "commit-1".into());
-    let said = fails("taken", &["land"]);
-    assert!(said.contains("graft/taken on GitHub already exists"), "{said}");
-    gft.run(&home, &["rm", "--force", "taken"]);
+    let landed = gft.run(&at("taken"), &["land"]);
+    assert!(landed.contains("graft/taken-2 at "), "{landed}");
+    {
+        let made = made.lock().unwrap();
+        assert_eq!(made.refs["heads/graft/taken"], "commit-1");
+        assert_eq!(made.commits.last().unwrap()["parents"], json!([first]));
+    }
+    gft.run(&home, &["rm", "taken"]);
 
     // Someone adds a commit to fix's branch on GitHub: landing over it would undo it.
     {
@@ -745,4 +866,305 @@ fn copies_of_a_checkout_start_from_its_work() {
     gft.run(&copy, &["sync"]);
     assert_eq!(gft.run(&copy, &["changes"]), "A more.txt\nA new.txt\n");
     gft.run(&app, &["rm", "--force", "try"]);
+}
+
+/// A repository on a stand-in GitHub, with a home copy at `work/app`.
+fn project() -> (tempfile::TempDir, tempfile::TempDir, Gft, Arc<Mutex<Made>>) {
+    let upstream = tempfile::Builder::new().prefix("graft-upstream").tempdir().unwrap();
+    let repo = upstream.path();
+    git(repo, &["init", "-q"]);
+    git(repo, &["config", "uploadpack.allowFilter", "true"]);
+    std::fs::write(repo.join("README.md"), "one\ntwo\nthree\n").unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-q", "-m", "first"]);
+    let (api, made) = fake_github();
+    made.lock().unwrap().repo = Some(repo.to_path_buf());
+    let gft = Gft { sandfs_home: tempfile::tempdir().unwrap(), graft_home: tempfile::tempdir().unwrap(), api };
+    let work = tempfile::tempdir().unwrap();
+    gft.run(work.path(), &["get", &format!("file://{}", repo.display()), "app", "--github", "o/n"]);
+    (upstream, work, gft, made)
+}
+
+fn commit_upstream(repo: &Path, path: &str, text: &str) -> String {
+    std::fs::write(repo.join(path), text).unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-q", "-m", path]);
+    git(repo, &["rev-parse", "HEAD"])
+}
+
+#[test]
+fn conflicts_hold_landing_until_settled() {
+    if !mounts() {
+        return;
+    }
+    let (upstream, work, gft, made) = project();
+    let work = work.path().canonicalize().unwrap();
+    let (home, copy) = (work.join("app"), work.join("app+fix"));
+    gft.run(&home, &["new", "fix"]);
+    std::fs::write(copy.join("README.md"), "one\nTWO here\nthree\n").unwrap();
+    commit_upstream(upstream.path(), "README.md", "one\ntwo upstream\nthree\n");
+
+    // A sync that leaves conflict markers says so, and exits with 2.
+    let synced = gft.try_run(&copy, &["sync"]);
+    assert_eq!(synced.status.code(), Some(2));
+    let said = String::from_utf8_lossy(&synced.stdout);
+    assert!(said.contains("conflict\tREADME.md") && said.contains("1 need a look"), "{said}");
+    assert!(String::from_utf8_lossy(&synced.stderr).contains("1 file has conflict markers"));
+    assert!(gft.run(&copy, &["status"]).contains("conflicts  README.md"));
+    // Synced again, they are still there and still said.
+    let again = gft.try_run(&copy, &["sync"]);
+    assert_eq!(again.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&again.stdout).contains("conflict markers in: README.md"));
+    // Landing refuses them, unless told to publish them as they are.
+    let refused = gft.try_run(&copy, &["land"]);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("1 file still has conflict markers"));
+    assert!(made.lock().unwrap().commits.is_empty());
+    let plan = gft.run(&copy, &["land", "-n", "--allow-conflicts"]);
+    assert!(plan.contains("M README.md"), "{plan}");
+    // Settled, it lands.
+    gft.run(&copy, &["save", "with markers"]);
+    std::fs::write(copy.join("README.md"), "one\nTWO upstream\nthree\n").unwrap();
+    assert!(!gft.run(&copy, &["status"]).contains("conflicts"));
+    gft.run(&copy, &["land"]);
+    assert_eq!(made.lock().unwrap().commits.len(), 1);
+    gft.run(&copy, &["sync"]);
+    // Undone back to before they were settled, the markers count again.
+    gft.run(&copy, &["undo"]);
+    assert!(gft.run(&copy, &["status"]).contains("conflicts  README.md"));
+    let refused = gft.try_run(&copy, &["land"]);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("still has conflict markers"));
+}
+
+#[test]
+fn closed_and_merged_pull_requests_take_no_more_commits() {
+    if !mounts() {
+        return;
+    }
+    let (upstream, work, gft, made) = project();
+    let repo = upstream.path();
+    let work = work.path().canonicalize().unwrap();
+    let home = work.join("app");
+    let at = |name: &str| work.join(format!("app+{name}"));
+    gft.run(&home, &["new", "closed", "merged"]);
+    for name in ["closed", "merged"] {
+        std::fs::write(at(name).join(format!("{name}.txt")), "first\n").unwrap();
+        gft.run(&at(name), &["land"]);
+    }
+
+    // Closed without being merged: landing more needs reopening it, or a new one.
+    made.lock().unwrap().pulls[0]["state"] = json!("closed");
+    std::fs::write(at("closed").join("closed.txt"), "second\n").unwrap();
+    let refused = gft.try_run(&at("closed"), &["land"]);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("#1 was closed without being merged"));
+    assert_eq!(made.lock().unwrap().refs["heads/graft/closed"], "commit-1");
+    let landed = gft.run(&at("closed"), &["land", "--new-pr", "--force"]);
+    assert!(landed.contains("graft/closed-2 at ") && landed.contains("pull/3"), "{landed}");
+
+    // Merged: what lands next needs to go on top of it, after a sync.
+    let merge = commit_upstream(repo, "merged.txt", "first\n");
+    {
+        let mut made = made.lock().unwrap();
+        made.pulls[1]["state"] = json!("closed");
+        made.pulls[1]["merged_at"] = json!("2026-10-26T00:00:00Z");
+        made.pulls[1]["merge_commit_sha"] = json!(merge);
+    }
+    std::fs::write(at("merged").join("merged.txt"), "first\nand more\n").unwrap();
+    let refused = gft.try_run(&at("merged"), &["land"]);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("#2 was merged; `gft sync merged` first"));
+    // Synced, it takes in the merge without a conflict: what it landed is what
+    // upstream's version is merged from.
+    let synced = gft.run(&at("merged"), &["sync"]);
+    assert!(synced.contains("merged\tmerged.txt") && synced.contains("#2 was merged"), "{synced}");
+    assert_eq!(gft.run(&at("merged"), &["changes"]), "M merged.txt\n");
+    let landed = gft.run(&at("merged"), &["land"]);
+    assert!(landed.contains("graft/merged-2 at ") && landed.contains("pull/4"), "{landed}");
+    let made = made.lock().unwrap();
+    assert_eq!(made.commits.last().unwrap()["parents"], json!([merge]));
+}
+
+#[test]
+fn copies_built_on_merged_work_move_onto_main_with_it() {
+    if !mounts() {
+        return;
+    }
+    let (upstream, work, gft, made) = project();
+    let repo = upstream.path();
+    let work = work.path().canonicalize().unwrap();
+    let home = work.join("app");
+    let (parent, child) = (work.join("app+parent"), work.join("app+child"));
+    gft.run(&home, &["new", "parent"]);
+    std::fs::write(parent.join("README.md"), "one\ntwo from parent\nthree\n").unwrap();
+    std::fs::write(parent.join("lib.txt"), "a\nb\n").unwrap();
+    gft.run(&parent, &["land"]);
+    gft.run(&home, &["new", "child", "--on", "parent"]);
+    std::fs::write(child.join("lib.txt"), "a\nb\nc from child\n").unwrap();
+    gft.run(&child, &["land"]);
+
+    // The parent is squash-merged and its branch deleted, which closes the child's
+    // pull request on GitHub.
+    std::fs::write(repo.join("README.md"), "one\ntwo from parent\nthree\n").unwrap();
+    let squash = commit_upstream(repo, "lib.txt", "a\nb\n");
+    {
+        let mut made = made.lock().unwrap();
+        made.pulls[0]["state"] = json!("closed");
+        made.pulls[0]["merged_at"] = json!("2026-10-26T00:00:00Z");
+        made.pulls[0]["merge_commit_sha"] = json!(squash);
+        made.refs.remove("heads/graft/parent");
+        made.pulls[1]["state"] = json!("closed");
+    }
+    // Landing first is sent to sync; sync merges from the parent's landing, so only
+    // the child's own change is left, with no conflict.
+    let refused = gft.try_run(&child, &["land"]);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("graft/parent was merged"));
+    let synced = gft.run(&child, &["sync"]);
+    assert!(synced.contains("now builds on main") && synced.contains("opens a new one"), "{synced}");
+    assert!(!synced.contains("conflict"), "{synced}");
+    assert_eq!(std::fs::read_to_string(child.join("lib.txt")).unwrap(), "a\nb\nc from child\n");
+    assert_eq!(gft.run(&child, &["changes"]), "M lib.txt\n");
+    let landed = gft.run(&child, &["land"]);
+    assert!(landed.contains("graft/child-2 at ") && landed.contains("pull/3"), "{landed}");
+    {
+        let made = made.lock().unwrap();
+        assert_eq!(made.pulls[2]["base"], "main");
+        assert_eq!(made.commits.last().unwrap()["parents"], json!([squash]));
+    }
+
+    // A pull request still open when the work under it merges goes against main
+    // on the next landing.
+    gft.run(&home, &["new", "base2"]);
+    std::fs::write(work.join("app+base2/two.txt"), "x\n").unwrap();
+    gft.run(&work.join("app+base2"), &["land"]);
+    gft.run(&home, &["new", "top", "--on", "base2"]);
+    std::fs::write(work.join("app+top/top.txt"), "y\n").unwrap();
+    gft.run(&work.join("app+top"), &["land"]);
+    let merged = commit_upstream(repo, "two.txt", "x\n");
+    {
+        let mut made = made.lock().unwrap();
+        made.pulls[3]["state"] = json!("closed");
+        made.pulls[3]["merged_at"] = json!("2026-10-26T00:00:00Z");
+        made.pulls[3]["merge_commit_sha"] = json!(merged);
+    }
+    gft.run(&work.join("app+top"), &["sync"]);
+    std::fs::write(work.join("app+top/top.txt"), "y\nz\n").unwrap();
+    gft.run(&work.join("app+top"), &["land"]);
+    assert_eq!(made.lock().unwrap().retargets, [(5, "main".to_owned())]);
+
+    // Merged into the branch it was built on, which is still open: the copy stays
+    // on that branch until it merges.
+    gft.run(&home, &["new", "base3"]);
+    std::fs::write(work.join("app+base3/three.txt"), "x\n").unwrap();
+    gft.run(&work.join("app+base3"), &["land"]);
+    gft.run(&home, &["new", "mid", "--on", "base3"]);
+    std::fs::write(work.join("app+mid/mid.txt"), "y\n").unwrap();
+    gft.run(&work.join("app+mid"), &["land"]);
+    gft.run(&home, &["new", "leaf", "--on", "mid"]);
+    // A link that lands as a link: nothing reads where it points.
+    std::os::unix::fs::symlink("/dev/zero", work.join("app+leaf/zero")).unwrap();
+    gft.run(&work.join("app+leaf"), &["land", "--dry-run"]);
+    {
+        let mut made = made.lock().unwrap();
+        assert_eq!(made.pulls[6]["base"], "graft/base3");
+        made.pulls[6]["state"] = json!("closed");
+        made.pulls[6]["merged_at"] = json!("2026-10-26T00:00:00Z");
+    }
+    commit_upstream(repo, "elsewhere.txt", "z\n");
+    let synced = gft.run(&work.join("app+mid"), &["sync"]);
+    assert!(!synced.contains("new one") && !synced.contains("builds on main"), "{synced}");
+    let refused = gft.try_run(&work.join("app+mid"), &["land"]);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("#7 was merged into graft/base3, not main"));
+    // Nor is the copy built on it moved onto main, which has none of their work yet.
+    let synced = gft.run(&work.join("app+leaf"), &["sync"]);
+    assert!(!synced.contains("builds on main"), "{synced}");
+    // Once the branch it was merged into reaches main, it moves onto main.
+    std::fs::write(repo.join("three.txt"), "x\n").unwrap();
+    let merged = commit_upstream(repo, "mid.txt", "y\n");
+    {
+        let mut made = made.lock().unwrap();
+        let head = made.refs["heads/graft/base3"].clone();
+        made.pulls[6]["merge_commit_sha"] = json!(head);
+        made.pulls[5]["state"] = json!("closed");
+        made.pulls[5]["merged_at"] = json!("2026-10-26T00:00:00Z");
+        made.pulls[5]["merge_commit_sha"] = json!(merged);
+    }
+    let synced = gft.run(&work.join("app+leaf"), &["sync"]);
+    assert!(synced.contains("graft/mid was merged (#7); leaf now builds on main"), "{synced}");
+    // The copy merged on the way merges upstream's later edits from what it landed.
+    commit_upstream(repo, "mid.txt", "y\nupstream\n");
+    let synced = gft.run(&work.join("app+mid"), &["sync"]);
+    assert!(synced.contains("#7 was merged; mid lands next as a new one"), "{synced}");
+    assert!(!synced.contains("conflict"), "{synced}");
+    assert_eq!(std::fs::read_to_string(work.join("app+mid/mid.txt")).unwrap(), "y\nupstream\n");
+}
+
+#[test]
+fn undo_keeps_what_it_undoes() {
+    if !mounts() {
+        return;
+    }
+    let (_upstream, work, gft, _made) = project();
+    let work = work.path().canonicalize().unwrap();
+    let copy = work.join("app+try");
+    gft.run(&work.join("app"), &["new", "try"]);
+    std::fs::write(copy.join("README.md"), "saved\n").unwrap();
+    gft.run(&copy, &["save", "good"]);
+    std::fs::write(copy.join("README.md"), "unsaved\n").unwrap();
+    let undone = gft.run(&copy, &["undo"]);
+    assert!(undone.contains("`gft undo` again returns to how it was"), "{undone}");
+    assert_eq!(std::fs::read_to_string(copy.join("README.md")).unwrap(), "saved\n");
+    gft.run(&copy, &["undo"]);
+    assert_eq!(std::fs::read_to_string(copy.join("README.md")).unwrap(), "unsaved\n");
+    // Nothing changed since the last snapshot: no new one.
+    let listed = gft.run(&copy, &["undo", "--list"]);
+    assert_eq!(listed.lines().count(), 3, "{listed}");
+    // A sync with nothing to take in keeps no snapshot either.
+    gft.run(&copy, &["save", "now"]);
+    std::fs::write(copy.join("README.md"), "unsaved, then more\n").unwrap();
+    let synced = gft.run(&copy, &["sync"]);
+    assert!(synced.contains("is up to date"), "{synced}");
+    assert_eq!(gft.run(&copy, &["undo", "--list"]).lines().count(), 4);
+}
+
+#[test]
+fn many_new_copies_at_once_and_dropping_the_project() {
+    if !mounts() {
+        return;
+    }
+    let (upstream, work, gft, _made) = project();
+    let work = work.path().canonicalize().unwrap();
+    let home = work.join("app");
+    // Upstream moved, so the first of them brings the default branch up to date.
+    let newest = commit_upstream(upstream.path(), "later.txt", "later\n");
+    std::thread::sleep(std::time::Duration::from_secs(11));
+    let gft = Arc::new(gft);
+    let runs: Vec<_> = (0..8)
+        .map(|n| {
+            let (gft, home) = (gft.clone(), home.clone());
+            std::thread::spawn(move || gft.try_run(&home, &["new", &format!("c{n}")]))
+        })
+        .collect();
+    for run in runs {
+        let out = run.join().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    for n in 0..8 {
+        assert_eq!(git(&work.join(format!("app+c{n}")), &["rev-parse", "HEAD"]), newest);
+    }
+
+    // Dropping the project keeps copies with work that never landed, and work in
+    // the home copy, unless forced.
+    std::fs::write(work.join("app+c0/work.txt"), "work\n").unwrap();
+    std::fs::write(home.join("home.txt"), "work at home\n").unwrap();
+    let kept = gft.try_run(&home, &["drop"]);
+    assert!(String::from_utf8_lossy(&kept.stderr).contains("c0 has 1 file that never landed"));
+    assert!(work.join("app+c1").join("README.md").exists());
+    gft.run(&home, &["rm", "--force", "c0"]);
+    let kept = gft.try_run(&home, &["drop"]);
+    assert!(String::from_utf8_lossy(&kept.stderr).contains("has 1 file changed in it"));
+    assert!(work.join("app+c1").join("README.md").exists());
+    gft.run(&work, &["drop", "o/n", "--force"]);
+    assert!(!home.exists(), "home left");
+    assert!(!work.join("app+c1").exists(), "copy left");
+    assert!(String::from_utf8_lossy(&gft.try_run(&work, &["ls"]).stderr).contains("start with `gft get"));
+    // And it can start over.
+    gft.run(&work, &["get", &format!("file://{}", upstream.path().display()), "app", "--github", "o/n"]);
 }

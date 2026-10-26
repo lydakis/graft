@@ -45,6 +45,12 @@ pub fn copy_changes(name: &str, since: Option<&str>, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether the workspaces `a` and `b` hold the same files, build output included.
+pub fn same(a: &str, b: &str) -> Result<bool> {
+    let options = ChangesOptions { since: Some(b.to_owned()), ..Default::default() };
+    Ok(sandfs()?.changes(a, &options)?.changes.is_empty())
+}
+
 /// A changed file: `A`, `M` or `D`, and the path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Change {

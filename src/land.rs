@@ -34,21 +34,101 @@ pub struct Options<'a> {
     pub force: bool,
     /// Say what landing would do, changing nothing.
     pub dry_run: bool,
+    /// Open a new pull request rather than add to the copy's earlier one.
+    pub new_pr: bool,
+    /// Land files that still have conflict markers from a sync.
+    pub allow_conflicts: bool,
 }
 
 pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<()> {
     let project = store.load(repo)?;
     let mut copy = crate::copy(&project, name)?.clone();
     crate::mount_copy(&copy)?;
+    // Conflict markers a sync left are no change anyone means to publish.
+    let marked = crate::marked(&copy, true)?;
+    if !options.dry_run && marked != copy.conflicts {
+        record(store, repo, name, |copy| copy.conflicts = marked.clone())?;
+    }
+    if !marked.is_empty() && !options.allow_conflicts {
+        let paths: Vec<&str> = marked.iter().map(String::as_str).collect();
+        bail!(
+            "{} still {} conflict markers from `gft sync`: {}. Settle them first, or land with \
+             --allow-conflicts to publish them as they are",
+            crate::files(marked.len()),
+            if marked.len() == 1 { "has" } else { "have" },
+            paths.join(", ")
+        );
+    }
     let github = GitHub::new(repo)?;
+    // Built on work merged since: its files still have that work as it was, and sync
+    // takes in the merged version.
+    if let Some(stacked) = &copy.stacked
+        && let Some(merged) = merged_pull(&github, repo, stacked, &project.branch)?
+    {
+        bail!(
+            "{} was merged (pull request #{merged}); `gft sync {name}` to move onto {} with it, then land",
+            stacked.branch,
+            project.branch
+        );
+    }
+    // The pull request as GitHub has it now. One merged, or closed, takes no more
+    // commits: the copy lands afresh, on a branch and a pull request of its own.
+    let mut open_base = None;
+    if let Some(pr) = copy.pr.clone() {
+        let pull = github.call("GET", &format!("pulls/{}", pr.number), None)?;
+        let merged = pull["merged"].as_bool() == Some(true) || pull["merged_at"].is_string();
+        let open = pull["state"] == "open";
+        if open && !options.new_pr {
+            open_base = pull["base"]["ref"].as_str().map(str::to_owned);
+        } else {
+            if merged && pull["base"]["ref"] != project.branch.as_str() {
+                let into = pull["base"]["ref"].as_str().unwrap_or("another branch");
+                bail!(
+                    "pull request #{} was merged into {into}, not {}: once {into} is merged, `gft sync {name}` \
+                     moves {name} onto {} with both, and it lands again as a new pull request",
+                    pr.number,
+                    project.branch,
+                    project.branch
+                );
+            }
+            if merged {
+                let merge = pull["merge_commit_sha"].as_str().unwrap_or_default();
+                if !merge.is_empty() && !contains(&github, &copy.base, merge)? {
+                    bail!(
+                        "pull request #{} was merged; `gft sync {name}` first, so what lands next goes on top of it",
+                        pr.number
+                    );
+                }
+                println!("pull request #{} was merged; landing {name} as a new one", pr.number);
+            } else if !open && !options.new_pr {
+                bail!(
+                    "pull request #{} was closed without being merged. Reopen it on GitHub and land again, or \
+                     land with --new-pr to open another",
+                    pr.number
+                );
+            } else {
+                println!("leaving pull request #{} as it is; landing {name} as a new one", pr.number);
+            }
+            copy.pr = None;
+            copy.landed = None;
+            copy.pending = None;
+            if !options.dry_run {
+                record(store, repo, name, |copy| {
+                    copy.pr = None;
+                    copy.landed = None;
+                    copy.pending = None;
+                })?;
+            }
+        }
+    }
     // The branch it lands on, and what that branch's pull request is based on: the
     // branch of the landing it was made on top of, else the default branch.
-    let branch = copy.landed.as_ref().map_or_else(|| format!("graft/{name}"), |landed| landed.branch.clone());
+    let mut branch = match (&copy.pending, &copy.landed) {
+        (Some(landing), _) | (None, Some(landing)) => landing.branch.clone(),
+        (None, None) => format!("graft/{name}"),
+    };
     let pr_base = copy.stacked.as_ref().map_or(project.branch.clone(), |stacked| stacked.branch.clone());
-    let head = github
-        .get_opt(&format!("git/ref/heads/{branch}"))?
-        .map(|found| found["object"]["sha"].as_str().map(str::to_owned).context("GitHub gave a branch without a sha"))
-        .transpose()?;
+    let mut head = head_of(&github, &branch)?;
 
     // A landing cut short after its commit was made: if the branch moved to it, it
     // landed; if the branch is still where it was, it never did, and is made afresh.
@@ -64,6 +144,18 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
         && landed.commit.is_empty()
     {
         landed.commit = head.clone();
+    }
+    // A first landing onto a branch that exists already, left by an earlier copy of
+    // the same name or by anyone else, takes a name of its own instead of their history.
+    // `--new-pr` always does, `--force` or not: the earlier pull request stays as it is.
+    if copy.landed.is_none() && head.is_some() && (!options.force || options.new_pr) {
+        copy.pending = None;
+        let mut n = 2;
+        while head.is_some() {
+            branch = format!("graft/{name}-{n}");
+            head = head_of(&github, &branch)?;
+            n += 1;
+        }
     }
     // The branch's last commit is this copy's own only when its last landing left it
     // there. Matching files don't make it so: someone else's branch stays theirs.
@@ -122,6 +214,17 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
         None => footer,
     };
     let describe = |number: u64| github.call("PATCH", &format!("pulls/{number}"), Some(&json!({"body": body})));
+    // A pull request that goes against another branch than it should, as one built
+    // on work merged since, goes against the right one.
+    let retarget = |number: u64| -> Result<bool> {
+        match &open_base {
+            Some(base) if *base != pr_base => {
+                github.call("PATCH", &format!("pulls/{number}"), Some(&json!({"base": pr_base})))?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    };
 
     let mut entries = Vec::new();
     let mut files = BTreeMap::new();
@@ -202,10 +305,18 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
 
     let pr = match pr {
         Some(pr) if current => {
-            // Only the description is new.
+            // Only the description, or what the pull request goes against, is new.
+            let moved = retarget(pr.number)?;
             if given {
                 describe(pr.number)?;
                 println!("{branch} already has {name} as it is; described it anew: {}", pr.url);
+                return Ok(());
+            }
+            if moved {
+                println!(
+                    "{branch} already has {name} as it is; its pull request now goes against {pr_base}: {}",
+                    pr.url
+                );
                 return Ok(());
             }
             bail!("nothing new to land: {branch} already has {name} as it is");
@@ -214,6 +325,7 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
             if given {
                 describe(pr.number)?;
             }
+            retarget(pr.number)?;
             pr
         }
         // One made by a landing whose answer never came back is found, not made twice.
@@ -280,6 +392,77 @@ fn record(store: &Store, repo: &str, name: &str, change: impl FnOnce(&mut crate:
         change(project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?);
         Ok(())
     })
+}
+
+/// The commit the branch `branch` is at on GitHub, if it exists.
+fn head_of(github: &GitHub, branch: &str) -> Result<Option<String>> {
+    github
+        .get_opt(&format!("git/ref/heads/{branch}"))?
+        .map(|found| found["object"]["sha"].as_str().map(str::to_owned).context("GitHub gave a branch without a sha"))
+        .transpose()
+}
+
+/// The number of the pull request that carried `landing` into the branch `into` (the
+/// default branch), if one did: one from its branch whose last commit has the
+/// landing's. A branch name used again after an earlier pull request from it was
+/// merged doesn't count. One merged into another copy's branch counts once that
+/// branch's own pull request, with the merge, reaches `into`, however many branches
+/// the work went through on the way.
+pub fn merged_pull(github: &GitHub, repo: &str, landing: &Landing, into: &str) -> Result<Option<u64>> {
+    let owner = repo.split('/').next().expect("owner/name");
+    let (mut branch, mut commit) = (landing.branch.clone(), landing.commit.clone());
+    let mut first = None;
+    // A stack is a few copies deep; the bound only stops a cycle of branches.
+    for _ in 0..16 {
+        let found = github.call("GET", &format!("pulls?head={owner}:{branch}&state=closed"), None)?;
+        let mut next = None;
+        for pull in found.as_array().map(Vec::as_slice).unwrap_or_default() {
+            let head = pull["head"]["sha"].as_str().unwrap_or_default();
+            if pull["merged_at"].is_string() && !head.is_empty() && contains(github, head, &commit)? {
+                next = Some(pull.clone());
+                break;
+            }
+        }
+        let Some(pull) = next else { return Ok(None) };
+        let number = first.get_or_insert(pull["number"].as_u64());
+        let base = pull["base"]["ref"].as_str().unwrap_or_default();
+        if base == into {
+            return Ok(*number);
+        }
+        // Merged into another branch: its work reaches `into` with that branch's.
+        let Some(merge) = pull["merge_commit_sha"].as_str() else { return Ok(None) };
+        (branch, commit) = (base.to_owned(), merge.to_owned());
+    }
+    Ok(None)
+}
+
+/// Whether `commit` has `ancestor` in its history, as GitHub sees it. A commit
+/// GitHub doesn't have has nothing.
+fn contains(github: &GitHub, commit: &str, ancestor: &str) -> Result<bool> {
+    let compared = github.get_opt(&format!("compare/{ancestor}...{commit}"))?;
+    Ok(compared.is_some_and(|compared| matches!(compared["status"].as_str(), Some("identical" | "ahead"))))
+}
+
+/// The bytes of `path` in `commit` on GitHub, none when the commit has no file there.
+pub fn file_at(github: &GitHub, commit: &str, path: &str) -> Result<Option<Vec<u8>>> {
+    let encoded: String = path
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => (byte as char).to_string(),
+            _ => format!("%{byte:02X}"),
+        })
+        .collect();
+    let Some(found) = github.get_opt(&format!("contents/{encoded}?ref={commit}"))? else { return Ok(None) };
+    if found["type"] != "file" {
+        return Ok(None);
+    }
+    // Over a megabyte, the contents come by themselves.
+    let found = match found["content"].as_str() {
+        Some(content) if !content.is_empty() => found,
+        _ => github.call("GET", &format!("git/blobs/{}", sha(&found)?), None)?,
+    };
+    let content: String = found["content"].as_str().unwrap_or_default().split_whitespace().collect();
+    Ok(Some(base64::engine::general_purpose::STANDARD.decode(content).context("GitHub sent unreadable contents")?))
 }
 
 /// The open pull request from `branch`, if there is one.

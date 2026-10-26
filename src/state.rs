@@ -4,12 +4,13 @@
 //! ```text
 //! projects/<owner>/<repo>.json   the project, its copies and their snapshots
 //! projects/<owner>/<repo>.lock   held while a command changes that file
+//! projects/<owner>/<repo>.main    held while new copies bring the default branch up to date
 //! ```
 //!
 //! The files themselves live in sandfs: every copy and snapshot is a sandfs
 //! workspace, named `<repo>.<copy>` and `<repo>.<copy>.<n>`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
@@ -43,6 +44,10 @@ pub struct Project {
     /// numbers their bases.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub takes: u64,
+    /// When the default branch was last brought up to date for new copies, in seconds
+    /// since the Unix epoch.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fetched: u64,
     #[serde(default)]
     pub copies: BTreeMap<String, Copy>,
 }
@@ -81,6 +86,10 @@ pub struct Copy {
     /// Its pull request, once made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<Pr>,
+    /// Files `gft sync` left with conflict markers, which `land` refuses until they
+    /// are gone.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub conflicts: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub snapshots: Vec<Snapshot>,
     /// The number the next snapshot's workspace gets.
@@ -207,10 +216,31 @@ impl Store {
         self.save(project)
     }
 
+    /// Take the right to bring the project's default branch up to date and copy it,
+    /// waiting for any other command doing so.
+    pub fn lock_main(&self, repo: &str) -> Result<File> {
+        self.lock_file(&self.file(repo, "main"))
+    }
+
+    /// Forget the project `repo`.
+    pub fn forget(&self, repo: &str) -> Result<()> {
+        {
+            let _lock = self.lock(repo)?;
+            std::fs::remove_file(self.file(repo, "json")).with_context(|| format!("forgetting {repo}"))?;
+        }
+        for ext in ["lock", "main"] {
+            let _ = std::fs::remove_file(self.file(repo, ext));
+        }
+        Ok(())
+    }
+
     fn lock(&self, repo: &str) -> Result<File> {
-        let path = self.file(repo, "lock");
+        self.lock_file(&self.file(repo, "lock"))
+    }
+
+    fn lock_file(&self, path: &Path) -> Result<File> {
         std::fs::create_dir_all(path.parent().expect("projects folder")).context("creating Graft's home")?;
-        let file = File::options().write(true).create(true).truncate(false).open(&path)?;
+        let file = File::options().write(true).create(true).truncate(false).open(path)?;
         file.lock().with_context(|| format!("locking {}", path.display()))?;
         Ok(file)
     }
