@@ -601,6 +601,21 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
     std::fs::write(at("fix").join("notes.txt"), "fix, and more\n").unwrap();
     let said = fails("fix", &["land"]);
     assert!(said.contains("graft/fix on GitHub has moved since fix last landed"), "{said}");
+    // Even put back as its base has it, fix lands over them when told to.
+    std::fs::remove_file(at("fix").join("notes.txt")).unwrap();
+    let said = fails("fix", &["land"]);
+    assert!(said.contains("has moved since"), "{said}");
+    let plan_tree = made.lock().unwrap().commits.len();
+    gft.run(&at("fix"), &["land", "--force"]);
+    {
+        let mut made = made.lock().unwrap();
+        assert_eq!(made.commits.len(), plan_tree + 1);
+        assert_eq!(made.commits.last().unwrap()["tree"], format!("tree-of-{first}"));
+        // And someone adds to the branch again.
+        made.commits.push(json!({"sha": "pushed", "tree": "tree-pushed"}));
+        made.refs.insert("heads/graft/fix".into(), "pushed".into());
+    }
+    std::fs::write(at("fix").join("notes.txt"), "fix, and more\n").unwrap();
     assert_eq!(made.lock().unwrap().refs["heads/graft/fix"], "pushed");
     gft.run(&at("fix"), &["land", "--force"]);
     let forced = made.lock().unwrap().refs["heads/graft/fix"].clone();

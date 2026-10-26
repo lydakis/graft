@@ -84,8 +84,8 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
 
     let changed = changes(&copy.workspace, None, &copy.dir)?;
     // A copy that landed and was then put back as its base has it lands all the
-    // same: its branch should lose those changes too.
-    if changed.is_empty() && ours.is_none() {
+    // same, while its branch is there: the branch should lose those changes too.
+    if changed.is_empty() && (copy.landed.is_none() || head.is_none()) {
         bail!("{name} has no changes to land");
     }
     // The description is kept in step with the one given, and always ends with where

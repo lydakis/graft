@@ -435,7 +435,9 @@ fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
     let (source, mut base) = match from {
         Some(from) => {
             let from = copy(&project, from)?;
-            stacked = from.landed.clone().or_else(|| from.stacked.clone());
+            // A landing kept by Graft before 0.1 doesn't say its commit until that copy
+            // lands again, so nothing is built on it until then.
+            stacked = from.landed.clone().or_else(|| from.stacked.clone()).filter(|landed| !landed.commit.is_empty());
             if let Some(stacked) = &mut stacked {
                 stacked.files.clear();
             }
