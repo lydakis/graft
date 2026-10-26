@@ -52,6 +52,20 @@ gft rm --force agent-07b            # delete one anyway, losing those changes
 
 Commands that take a copy use the one the current folder is in when none is named.
 
+If a first `gft land` stops after preparing its commit, run it again. Graft remembers
+that attempt before publishing the branch: retry publishes the saved commit if
+needed, then finds its open pull request or creates the missing one, without another
+commit or a duplicate pull request. The original title, description and draft setting
+are kept; an existing description is changed only if the retry gives `--body` or
+`--body-file`. Recovery leaves your files alone, including edits made since the
+interruption. Run `gft land` once more to land those later edits.
+
+An existing branch without a saved landing record is not adopted, even if its files
+match. A branch that moved, or a closed, mismatched or ambiguous pull request, stops
+recovery rather than changing someone else's work. This also means interruptions
+from older Graft versions, which saved no first-landing record, need a different
+copy name rather than automatic recovery.
+
 ## Many agents at once
 
 Give each agent its own copy, named for its task, and let each land its own pull request. Nothing is shared between copies, so one agent's half-finished edit never breaks another's build, and the copies cost almost nothing to make.

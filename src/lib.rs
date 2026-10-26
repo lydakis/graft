@@ -453,6 +453,7 @@ fn new(store: &Store, names: &[String], from: Option<&str>) -> Result<()> {
             base: commit,
             from: from.map(str::to_owned),
             pr: None,
+            pending_land: None,
             snapshots: Vec::new(),
             next: 1,
         };

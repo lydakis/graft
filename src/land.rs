@@ -16,7 +16,7 @@ use base64::Engine;
 use serde_json::{Value, json};
 
 use crate::github::GitHub;
-use crate::state::{Pr, Store};
+use crate::state::{PendingLand, Pr, Store};
 use crate::tools::{Change, changes, git, short};
 
 pub fn land(
@@ -29,6 +29,18 @@ pub fn land(
 ) -> Result<()> {
     let project = store.load(repo)?;
     let copy = crate::copy(&project, name)?.clone();
+    if let Some(pending) = &copy.pending_land {
+        let github = GitHub::new(repo)?;
+        let body = body.map(|body| description(name, Some(body)));
+        let pr = finish_first(store, &github, repo, name, pending, body.as_deref())?;
+        println!(
+            "recovered {} at {}: {}; files left as they are; run `gft land` again for further edits",
+            pr.branch,
+            short(&pending.commit),
+            pr.url
+        );
+        return Ok(());
+    }
     crate::mount_copy(&copy)?;
     let changed = changes(&copy.workspace, None, &copy.dir)?;
     if changed.is_empty() {
@@ -37,12 +49,8 @@ pub fn land(
     let github = GitHub::new(repo)?;
     // The description is kept in step with the one given, and always ends with where
     // the pull request came from.
-    let footer = format!("Landed with `gft land` from the copy `{name}`.");
     let given = body.is_some();
-    let body = match body.map(str::trim).filter(|text| !text.is_empty()) {
-        Some(text) => format!("{text}\n\n{footer}"),
-        None => footer,
-    };
+    let body = description(name, body);
     let describe = |number: u64| github.call("PATCH", &format!("pulls/{number}"), Some(&json!({"body": body})));
 
     // The branch it lands on, and what that branch's pull request is based on: the
@@ -50,6 +58,16 @@ pub fn land(
     let branch = copy.pr.as_ref().map_or_else(|| format!("graft/{name}"), |pr| pr.branch.clone());
     let from_pr = copy.from.as_ref().and_then(|from| project.copies.get(from)).and_then(|from| from.pr.clone());
     let pr_base = from_pr.as_ref().map_or(project.branch.clone(), |pr| pr.branch.clone());
+
+    let head = github
+        .get_opt(&format!("git/ref/heads/{branch}"))?
+        .map(|r| r["object"]["sha"].as_str().map(str::to_owned).context("GitHub gave a branch without a sha"))
+        .transpose()?;
+    if copy.pr.is_none() && head.is_some() {
+        bail!(
+            "{branch} already exists, but {name} has no landing record; use a different copy name; no branch was changed"
+        );
+    }
 
     let base_tree = commit_tree(&github, &copy.base)?;
     let mut entries = Vec::new();
@@ -74,9 +92,6 @@ pub fn land(
     let tree = github.call("POST", "git/trees", Some(&json!({"base_tree": base_tree, "tree": entries})))?;
     let tree = sha(&tree)?;
 
-    let head =
-        github.get_opt(&format!("git/ref/heads/{branch}"))?.map(|r| r["object"]["sha"].as_str().map(str::to_owned));
-    let head = head.flatten();
     let stacked_on = match (&head, &from_pr) {
         (None, Some(pr)) => github
             .get_opt(&format!("git/ref/heads/{}", pr.branch))?
@@ -114,33 +129,45 @@ pub fn land(
         Some(&json!({"message": commit_message, "tree": tree, "parents": parents})),
     )?;
     let commit = sha(&commit)?;
-    match head {
-        Some(_) => github.call("PATCH", &format!("git/refs/heads/{branch}"), Some(&json!({"sha": commit})))?,
-        None => {
-            github.call("POST", "git/refs", Some(&json!({"ref": format!("refs/heads/{branch}"), "sha": commit})))?
-        }
-    };
-
     let pr = match &copy.pr {
         Some(pr) => {
+            match head {
+                Some(_) => github.call("PATCH", &format!("git/refs/heads/{branch}"), Some(&json!({"sha": commit})))?,
+                None => github.call(
+                    "POST",
+                    "git/refs",
+                    Some(&json!({"ref": format!("refs/heads/{branch}"), "sha": commit})),
+                )?,
+            };
             if given {
                 describe(pr.number)?;
             }
             Pr { landed_on: copy.base.clone(), landed, ..pr.clone() }
         }
         None => {
-            let made = github.call(
-                "POST",
-                "pulls",
-                Some(&json!({"title": title, "head": branch, "base": pr_base, "body": body, "draft": draft})),
-            )?;
-            Pr {
-                number: made["number"].as_u64().context("GitHub gave no pull request number")?,
-                url: made["html_url"].as_str().unwrap_or_default().to_owned(),
+            let pending = PendingLand {
+                commit: commit.clone(),
                 branch: branch.clone(),
                 landed_on: copy.base.clone(),
                 landed,
-            }
+                base: pr_base,
+                title,
+                body,
+                draft,
+            };
+            // Save ownership and the exact files before making the branch visible.
+            // A lost response must not make a retry guess from a branch name alone.
+            store.edit(repo, |project| {
+                let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
+                if copy.pr.is_some() || copy.pending_land.is_some() {
+                    bail!("{name}'s landing record changed; retry `gft land`");
+                }
+                copy.pending_land = Some(pending.clone());
+                Ok(())
+            })?;
+            let pr = finish_first(store, &github, repo, name, &pending, None)?;
+            println!("{branch} at {}, {} files: {}", short(&commit), changed.len(), pr.url);
+            return Ok(());
         }
     };
     let url = pr.url.clone();
@@ -151,6 +178,97 @@ pub fn land(
     })?;
     println!("{branch} at {}, {} files: {url}", short(&commit), changed.len());
     Ok(())
+}
+
+fn description(name: &str, body: Option<&str>) -> String {
+    let footer = format!("Landed with `gft land` from the copy `{name}`.");
+    match body.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) => format!("{text}\n\n{footer}"),
+        None => footer,
+    }
+}
+
+/// Finish only the saved landing: edits since that attempt stay unlanded. Neither
+/// tree equality nor the copy name proves ownership of a branch or pull request.
+fn finish_first(
+    store: &Store,
+    github: &GitHub,
+    repo: &str,
+    name: &str,
+    pending: &PendingLand,
+    body: Option<&str>,
+) -> Result<Pr> {
+    let branch = &pending.branch;
+    let head = github.get_opt(&format!("git/ref/heads/{branch}"))?;
+    if head.as_ref().is_some_and(|head| head["object"]["sha"].as_str() != Some(&pending.commit)) {
+        bail!("{branch} moved since {name}'s interrupted landing; no branch or pull request was changed");
+    }
+    // Include closed PRs: a closed or merged request is not a missing request.
+    let owner = repo.split_once('/').context("a GitHub repository needs owner/name")?.0;
+    let head_filter = format!("{owner}%3A{}", branch.replace('/', "%2F"));
+    let pulls = github.call("GET", &format!("pulls?state=all&head={head_filter}&per_page=100"), None)?;
+    let pulls = pulls.as_array().context("GitHub gave no pull request list")?;
+    let found = match pulls.as_slice() {
+        [] => None,
+        [pr] if matches_first_pr(pr, pending, repo) => Some(pr),
+        _ => bail!(
+            "{branch} has a closed or unrelated pull request, or more than one; no pull request was adopted or changed"
+        ),
+    };
+    // A merged PR may have had its branch deleted. Do not resurrect it before
+    // checking history, even though the saved commit still belongs to this copy.
+    if head.is_none() {
+        github.call(
+            "POST",
+            "git/refs",
+            Some(&json!({"ref": format!("refs/heads/{branch}"), "sha": pending.commit})),
+        )?;
+    }
+    let made = match found {
+        Some(pr) => pr.clone(),
+        None => github.call(
+            "POST",
+            "pulls",
+            Some(&json!({
+                "title": pending.title, "head": branch, "base": pending.base,
+                "body": body.unwrap_or(&pending.body), "draft": pending.draft,
+            })),
+        )?,
+    };
+    // The branch can move between checking it and creating the PR. Do not mark
+    // the saved files as landed unless the creation response confirms them too.
+    if !matches_first_pr(&made, pending, repo) {
+        bail!("{branch}'s pull request does not match the saved landing; its landing record was kept for recovery");
+    }
+    let pr = Pr {
+        number: made["number"].as_u64().context("GitHub gave no pull request number")?,
+        url: made["html_url"].as_str().context("GitHub gave no pull request URL")?.to_owned(),
+        branch: pending.branch.clone(),
+        landed_on: pending.landed_on.clone(),
+        landed: pending.landed.clone(),
+    };
+    if let (Some(_), Some(body)) = (found, body) {
+        github.call("PATCH", &format!("pulls/{}", pr.number), Some(&json!({"body": body})))?;
+    }
+    store.edit(repo, |project| {
+        let copy = project.copies.get_mut(name).with_context(|| format!("no copy {name:?}"))?;
+        if copy.pending_land.as_ref().map(|p| &p.commit) != Some(&pending.commit) || copy.pr.is_some() {
+            bail!("{name}'s landing record changed; retry `gft land`");
+        }
+        copy.pr = Some(pr.clone());
+        copy.pending_land = None;
+        Ok(())
+    })?;
+    Ok(pr)
+}
+
+fn matches_first_pr(pr: &Value, pending: &PendingLand, repo: &str) -> bool {
+    pr["state"] == "open"
+        && pr["head"]["repo"]["full_name"].as_str().is_some_and(|name| name.eq_ignore_ascii_case(repo))
+        && pr["head"]["ref"] == pending.branch
+        && pr["head"]["sha"] == pending.commit
+        && pr["base"]["repo"]["full_name"].as_str().is_some_and(|name| name.eq_ignore_ascii_case(repo))
+        && pr["base"]["ref"] == pending.base
 }
 
 /// The id of the tree of `commit`.

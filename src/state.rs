@@ -52,6 +52,9 @@ pub struct Copy {
     /// Its pull request, once landed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<Pr>,
+    /// A first landing saved before publishing its branch, until its PR is recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_land: Option<PendingLand>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub snapshots: Vec<Snapshot>,
     /// The number the next snapshot's workspace gets.
@@ -70,6 +73,19 @@ pub struct Pr {
     /// Each file the last landing carried, as `fingerprint` saw it, for `gft rm`.
     #[serde(default)]
     pub landed: BTreeMap<String, String>,
+}
+
+/// Enough to finish a first landing without guessing who owns an existing branch.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingLand {
+    pub commit: String,
+    pub branch: String,
+    pub landed_on: String,
+    pub landed: BTreeMap<String, String>,
+    pub base: String,
+    pub title: String,
+    pub body: String,
+    pub draft: bool,
 }
 
 /// A copy as it was at one moment, kept as an unmounted sandfs workspace.

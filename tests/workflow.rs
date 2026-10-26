@@ -46,6 +46,11 @@ struct Made {
     pulls: Vec<Value>,
     /// The bodies of PATCH pulls/N, as `(N, body)`.
     patches: Vec<(u64, Value)>,
+    fail_pr: bool,
+    lose_pr_response: bool,
+    pr_attempts: usize,
+    move_on_pr_create: bool,
+    pull_list: Option<Vec<Value>>,
 }
 
 /// Answers the calls `gft land` makes, keeping what it was sent.
@@ -128,10 +133,40 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
                     made.refs.insert(p["git/refs/".len()..].to_owned(), body["sha"].as_str().unwrap().to_owned());
                     (200, json!({}))
                 }
+                ("GET", p) if p.starts_with("pulls?state=all&head=o%3A") => {
+                    let branch = p.split("head=o%3A").nth(1).unwrap().split('&').next().unwrap().replace("%2F", "/");
+                    let pulls = made.pull_list.clone().unwrap_or_else(|| made.pulls.iter().enumerate()
+                        .filter(|(_, pr)| pr["head"] == branch)
+                        .map(|(i, pr)| json!({
+                            "number": i + 1, "html_url": format!("https://github.com/o/n/pull/{}", i + 1),
+                            "state": "open", "body": pr["body"],
+                            "head": {"ref": branch, "sha": made.refs.get(&format!("heads/{branch}")), "repo": {"full_name": "o/n"}},
+                            "base": {"ref": pr["base"], "repo": {"full_name": "o/n"}},
+                        })).collect());
+                    (200, json!(pulls))
+                }
                 ("POST", "pulls") => {
-                    made.pulls.push(body);
-                    let n = made.pulls.len();
-                    (201, json!({"number": n, "html_url": format!("https://github.com/o/n/pull/{n}")}))
+                    made.pr_attempts += 1;
+                    if std::mem::take(&mut made.fail_pr) {
+                        (500, json!({"message": "injected PR-create failure"}))
+                    } else {
+                        let branch = body["head"].as_str().unwrap();
+                        if std::mem::take(&mut made.move_on_pr_create) {
+                            made.refs.insert(format!("heads/{branch}"), "replacement".to_owned());
+                        }
+                        let n = made.pulls.len() + 1;
+                        let answer = json!({
+                            "number": n, "html_url": format!("https://github.com/o/n/pull/{n}"), "state": "open",
+                            "head": {"ref": branch, "sha": made.refs.get(&format!("heads/{branch}")), "repo": {"full_name": "o/n"}},
+                            "base": {"ref": body["base"], "repo": {"full_name": "o/n"}},
+                        });
+                        made.pulls.push(body);
+                        if std::mem::take(&mut made.lose_pr_response) {
+                            (500, json!({"message": "injected lost PR response"}))
+                        } else {
+                            (201, answer)
+                        }
+                    }
                 }
                 ("PATCH", p) if p.starts_with("pulls/") => {
                     let number: u64 = p["pulls/".len()..].parse().unwrap();
@@ -207,6 +242,228 @@ impl Drop for Gft {
             }
         }
     }
+}
+
+/// A saved first landing can be recovered without a mount or reading today's
+/// files. This also keeps failure-path coverage on hosts without FUSE.
+struct Recovery {
+    work: tempfile::TempDir,
+    gft: Gft,
+    made: Arc<Mutex<Made>>,
+}
+
+impl Recovery {
+    fn new() -> Self {
+        let work = tempfile::tempdir().unwrap();
+        let dir = work.path().canonicalize().unwrap();
+        std::fs::write(dir.join("notes.txt"), "original files\n").unwrap();
+        let (api, made) = fake_github();
+        let gft = Gft { sandfs_home: tempfile::tempdir().unwrap(), graft_home: tempfile::tempdir().unwrap(), api };
+        let project = json!({
+            "repo": "o/n", "source": "unused", "home": dir.join("home"), "workspace": "n", "branch": "main",
+            "copies": {"recover": {
+                "dir": dir, "workspace": "n.recover", "base": "base-1",
+                "pending_land": {
+                    "commit": "commit-1", "base": "main", "title": "Original title", "body": "Original description.", "draft": true,
+                    "branch": "graft/recover", "landed_on": "base-1", "landed": {"notes.txt": "original fingerprint"}
+                }
+            }}
+        });
+        let path = gft.graft_home.path().join("projects/o/n.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec(&project).unwrap()).unwrap();
+        {
+            let mut made = made.lock().unwrap();
+            made.commits.push(json!({"sha": "commit-1", "tree": "tree-1"}));
+            made.refs.insert("heads/graft/recover".to_owned(), "commit-1".to_owned());
+        }
+        Self { work, gft, made }
+    }
+
+    fn project(&self) -> Value {
+        serde_json::from_slice(&std::fs::read(self.gft.graft_home.path().join("projects/o/n.json")).unwrap()).unwrap()
+    }
+
+    fn assert_recorded(&self) {
+        let project = self.project();
+        let copy = &project["copies"]["recover"];
+        assert!(copy.get("pending_land").is_none());
+        assert_eq!(copy["pr"]["number"], 1);
+        assert_eq!(copy["pr"]["landed_on"], "base-1");
+        assert_eq!(copy["pr"]["landed"]["notes.txt"], "original fingerprint");
+        let made = self.made.lock().unwrap();
+        assert_eq!(made.commits.len(), 1, "recovery must not commit");
+        assert_eq!(made.pulls.len(), 1, "recovery must not duplicate PRs");
+        assert_eq!(made.refs["heads/graft/recover"], "commit-1");
+    }
+}
+
+#[test]
+fn first_landing_retries_pr_create_failure_without_another_commit() {
+    let recovery = Recovery::new();
+    recovery.made.lock().unwrap().fail_pr = true;
+    let out = recovery.gft.try_run(recovery.work.path(), &["land"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("injected PR-create failure"));
+    assert!(recovery.project()["copies"]["recover"]["pr"].is_null());
+    assert_eq!(recovery.made.lock().unwrap().refs["heads/graft/recover"], "commit-1");
+    assert!(recovery.gft.run(recovery.work.path(), &["land"]).contains("recovered graft/recover"));
+    recovery.assert_recorded();
+    let made = recovery.made.lock().unwrap();
+    assert_eq!(made.pr_attempts, 2);
+    assert_eq!(made.pulls[0]["title"], "Original title");
+    assert_eq!(made.pulls[0]["body"], "Original description.");
+    assert_eq!(made.pulls[0]["draft"], true);
+    assert!(made.patches.is_empty());
+}
+
+#[test]
+fn first_landing_recovers_lost_pr_response_or_local_record_and_preserves_description_and_edits() {
+    for lose_response in [false, true] {
+        let recovery = Recovery::new();
+        let pending_state = recovery.project();
+        if lose_response {
+            recovery.made.lock().unwrap().lose_pr_response = true;
+            let out = recovery.gft.try_run(recovery.work.path(), &["land"]);
+            assert!(!out.status.success());
+            assert!(String::from_utf8_lossy(&out.stderr).contains("injected lost PR response"));
+        } else {
+            recovery.gft.run(recovery.work.path(), &["land"]);
+            // The PR exists, but the final local save did not survive.
+            std::fs::write(
+                recovery.gft.graft_home.path().join("projects/o/n.json"),
+                serde_json::to_vec(&pending_state).unwrap(),
+            )
+            .unwrap();
+        }
+        recovery.made.lock().unwrap().pulls[0]["body"] = json!("Edited on GitHub.");
+        std::fs::write(recovery.work.path().join("notes.txt"), "edits after interruption\n").unwrap();
+        recovery.gft.run(recovery.work.path(), &["land"]);
+        recovery.assert_recorded();
+        assert_eq!(
+            std::fs::read_to_string(recovery.work.path().join("notes.txt")).unwrap(),
+            "edits after interruption\n"
+        );
+        let made = recovery.made.lock().unwrap();
+        assert_eq!(made.pr_attempts, 1);
+        assert_eq!(made.pulls[0]["body"], "Edited on GitHub.");
+        assert!(made.patches.is_empty());
+    }
+}
+
+#[test]
+fn first_landing_recovery_changes_description_only_with_explicit_body() {
+    for existing in [false, true] {
+        let recovery = Recovery::new();
+        if existing {
+            recovery.made.lock().unwrap().lose_pr_response = true;
+            assert!(!recovery.gft.try_run(recovery.work.path(), &["land"]).status.success());
+        }
+        recovery.gft.run(recovery.work.path(), &["land", "--body", "Explicit replacement."]);
+        recovery.assert_recorded();
+        let made = recovery.made.lock().unwrap();
+        let body = json!("Explicit replacement.\n\nLanded with `gft land` from the copy `recover`.");
+        if existing {
+            assert_eq!(made.patches, [(1, body)]);
+        } else {
+            assert_eq!(made.pulls[0]["body"], body);
+            assert!(made.patches.is_empty());
+        }
+    }
+}
+
+#[test]
+fn first_landing_recovery_publishes_saved_commit_if_interrupted_before_ref_creation() {
+    let recovery = Recovery::new();
+    recovery.made.lock().unwrap().refs.clear();
+    recovery.gft.run(recovery.work.path(), &["land"]);
+    recovery.assert_recorded();
+}
+
+#[test]
+fn first_landing_recovery_refuses_moved_branch() {
+    let recovery = Recovery::new();
+    recovery.made.lock().unwrap().refs.insert("heads/graft/recover".to_owned(), "someone-elses-commit".to_owned());
+    let out = recovery.gft.try_run(recovery.work.path(), &["land", "--body", "Do not apply"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("moved since"));
+    let made = recovery.made.lock().unwrap();
+    assert_eq!(made.refs["heads/graft/recover"], "someone-elses-commit");
+    assert!(made.pulls.is_empty() && made.patches.is_empty());
+    assert!(recovery.project()["copies"]["recover"]["pr"].is_null());
+}
+
+#[test]
+fn first_landing_recovery_refuses_unrelated_closed_or_ambiguous_prs() {
+    let matching = json!({
+        "number": 42, "html_url": "https://github.com/o/n/pull/42", "state": "open",
+        "head": {"ref": "graft/recover", "sha": "commit-1", "repo": {"full_name": "o/n"}},
+        "base": {"ref": "main", "repo": {"full_name": "o/n"}},
+    });
+    for (pointer, value) in [
+        ("/state", "closed"),
+        ("/head/ref", "other"),
+        ("/head/sha", "other"),
+        ("/head/repo/full_name", "fork/n"),
+        ("/base/ref", "other"),
+        ("/base/repo/full_name", "fork/n"),
+        ("/duplicate", ""),
+    ] {
+        for missing_branch in [false, true] {
+            let recovery = Recovery::new();
+            if missing_branch {
+                recovery.made.lock().unwrap().refs.clear();
+            }
+            let mut pr = matching.clone();
+            let pulls = if pointer == "/duplicate" {
+                vec![pr.clone(), pr]
+            } else {
+                *pr.pointer_mut(pointer).unwrap() = json!(value);
+                vec![pr]
+            };
+            recovery.made.lock().unwrap().pull_list = Some(pulls);
+            let out = recovery.gft.try_run(recovery.work.path(), &["land", "--body", "Do not apply"]);
+            assert!(!out.status.success(), "{pointer}");
+            assert!(String::from_utf8_lossy(&out.stderr).contains("no pull request was adopted or changed"));
+            let made = recovery.made.lock().unwrap();
+            assert_eq!(made.pr_attempts, 0);
+            assert!(made.patches.is_empty());
+            if missing_branch {
+                assert!(made.refs.is_empty(), "refusal must not recreate a deleted branch");
+            }
+            assert!(recovery.project()["copies"]["recover"]["pr"].is_null());
+        }
+    }
+}
+
+#[test]
+fn first_landing_does_not_record_files_if_branch_moves_during_pr_creation() {
+    let recovery = Recovery::new();
+    recovery.made.lock().unwrap().move_on_pr_create = true;
+    let out = recovery.gft.try_run(recovery.work.path(), &["land"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not match the saved landing"));
+    let project = recovery.project();
+    assert!(project["copies"]["recover"]["pr"].is_null());
+    assert_eq!(project["copies"]["recover"]["pending_land"]["commit"], "commit-1");
+    let made = recovery.made.lock().unwrap();
+    assert_eq!(made.refs["heads/graft/recover"], "replacement");
+    assert_eq!(made.pulls.len(), 1);
+    assert!(made.patches.is_empty());
+}
+
+#[test]
+fn first_landing_recovery_accepts_canonical_repository_casing() {
+    let recovery = Recovery::new();
+    recovery.made.lock().unwrap().lose_pr_response = true;
+    assert!(!recovery.gft.try_run(recovery.work.path(), &["land"]).status.success());
+    recovery.made.lock().unwrap().pull_list = Some(vec![json!({
+        "number": 1, "html_url": "https://github.com/o/n/pull/1", "state": "open",
+        "head": {"ref": "graft/recover", "sha": "commit-1", "repo": {"full_name": "O/N"}},
+        "base": {"ref": "main", "repo": {"full_name": "O/N"}},
+    })]);
+    recovery.gft.run(recovery.work.path(), &["land"]);
+    recovery.assert_recorded();
 }
 
 #[test]
@@ -315,8 +572,32 @@ fn copies_are_made_compared_synced_and_landed() {
     assert_ne!(first, second);
 
     // Landing makes a branch, one commit on the newest base, and a pull request.
-    let landed = gft.run(&fix, &["land", "-m", "Make two return 2", "--body", "Two now returns 2.\n"]);
-    assert!(landed.contains("graft/fix at commit-1, 2 files: https://github.com/o/n/pull/1"), "{landed}");
+    made.lock().unwrap().fail_pr = true;
+    let interrupted = gft.try_run(&fix, &["land", "-m", "Make two return 2", "--body", "Two now returns 2.\n"]);
+    assert!(!interrupted.status.success());
+    assert!(String::from_utf8_lossy(&interrupted.stderr).contains("injected PR-create failure"));
+    {
+        let made = made.lock().unwrap();
+        assert_eq!(made.commits.len(), 1);
+        assert_eq!(made.refs["heads/graft/fix"], "commit-1");
+        assert!(made.pulls.is_empty());
+    }
+    let state_path = gft.graft_home.path().join("projects/o/n.json");
+    let state: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(state["copies"]["fix"]["pending_land"]["commit"], "commit-1");
+    assert!(state["copies"]["fix"]["pr"].is_null());
+    // The files are unchanged: retry must still finish the first landing.
+    let landed = gft.run(&fix, &["land"]);
+    assert!(landed.contains("recovered graft/fix at commit-1: https://github.com/o/n/pull/1"), "{landed}");
+    {
+        let made = made.lock().unwrap();
+        assert_eq!(made.commits.len(), 1);
+        assert_eq!(made.pulls.len(), 1);
+        assert!(made.patches.is_empty());
+    }
+    let state: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert!(state["copies"]["fix"].get("pending_land").is_none());
+    assert_eq!(state["copies"]["fix"]["pr"]["landed"].as_object().unwrap().len(), 2);
     assert!(gft.run(&fix, &["status"]).contains("pull request  https://github.com/o/n/pull/1\n"));
     {
         let made = made.lock().unwrap();
@@ -330,6 +611,21 @@ fn copies_are_made_compared_synced_and_landed() {
         assert_eq!(made.pulls[0]["title"], "Make two return 2");
         assert_eq!(made.pulls[0]["body"], "Two now returns 2.\n\nLanded with `gft land` from the copy `fix`.");
     }
+    // Even an identical tree does not make a pre-existing branch ours.
+    gft.run(&home, &["new", "collision", "--from", "fix"]);
+    let collision = work.join("app+collision");
+    made.lock().unwrap().refs.insert("heads/graft/collision".to_owned(), "commit-1".to_owned());
+    let refused = gft.try_run(&collision, &["land", "--body", "Do not overwrite"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("has no landing record"));
+    {
+        let made = made.lock().unwrap();
+        assert_eq!(made.commits.len(), 1);
+        assert_eq!(made.pulls.len(), 1);
+        assert!(made.patches.is_empty());
+        assert_eq!(made.refs["heads/graft/collision"], "commit-1");
+    }
+    gft.run(&home, &["rm", "collision", "--force"]);
     // Landing again adds a commit to the same pull request.
     std::fs::write(fix.join("notes.txt"), "why, and how\n").unwrap();
     let again = gft.run(&fix, &["land"]);
