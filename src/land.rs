@@ -8,6 +8,7 @@
 //! `gft sync` the new base becomes a second parent, so the pull request shows only the
 //! copy's own changes.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -16,17 +17,33 @@ use serde_json::{Value, json};
 
 use crate::github::GitHub;
 use crate::state::{Pr, Store};
-use crate::tools::{changes, short};
+use crate::tools::{Change, changes, git, short};
 
-pub fn land(store: &Store, repo: &str, name: &str, message: Option<&str>, draft: bool) -> Result<()> {
+pub fn land(
+    store: &Store,
+    repo: &str,
+    name: &str,
+    message: Option<&str>,
+    body: Option<&str>,
+    draft: bool,
+) -> Result<()> {
     let project = store.load(repo)?;
     let copy = crate::copy(&project, name)?.clone();
     crate::mount_copy(&copy)?;
-    let changed = changes(&copy.workspace, None)?;
+    let changed = changes(&copy.workspace, None, &copy.dir)?;
     if changed.is_empty() {
         bail!("{name} has no changes to land");
     }
     let github = GitHub::new(repo)?;
+    // The description is kept in step with the one given, and always ends with where
+    // the pull request came from.
+    let footer = format!("Landed with `gft land` from the copy `{name}`.");
+    let given = body.is_some();
+    let body = match body.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) => format!("{text}\n\n{footer}"),
+        None => footer,
+    };
+    let describe = |number: u64| github.call("PATCH", &format!("pulls/{number}"), Some(&json!({"body": body})));
 
     // The branch it lands on, and what that branch's pull request is based on: the
     // copy it came from, when that one has landed, else the default branch.
@@ -36,7 +53,10 @@ pub fn land(store: &Store, repo: &str, name: &str, message: Option<&str>, draft:
 
     let base_tree = commit_tree(&github, &copy.base)?;
     let mut entries = Vec::new();
+    let mut landed = BTreeMap::new();
     for change in &changed {
+        // Before reading the file: if it changes in between, it counts as not landed.
+        landed.insert(change.path.clone(), fingerprint(&copy.dir, change)?);
         entries.push(match change.kind {
             'D' => json!({"path": change.path, "mode": "100644", "type": "blob", "sha": null}),
             _ => {
@@ -66,6 +86,12 @@ pub fn land(store: &Store, repo: &str, name: &str, message: Option<&str>, draft:
     let mut parents: Vec<String> = head.clone().or(stacked_on).into_iter().collect();
     if let Some(head) = &head {
         if commit_tree(&github, head)? == tree {
+            // Only the description is new.
+            if let (true, Some(pr)) = (given, &copy.pr) {
+                describe(pr.number)?;
+                println!("{branch} already has {name} as it is; described it anew: {}", pr.url);
+                return Ok(());
+            }
             bail!("nothing new to land: {branch} already has {name} as it is");
         }
         // Moved onto a newer commit since the last landing: that commit joins in.
@@ -96,9 +122,13 @@ pub fn land(store: &Store, repo: &str, name: &str, message: Option<&str>, draft:
     };
 
     let pr = match &copy.pr {
-        Some(pr) => Pr { landed_on: copy.base.clone(), ..pr.clone() },
+        Some(pr) => {
+            if given {
+                describe(pr.number)?;
+            }
+            Pr { landed_on: copy.base.clone(), landed, ..pr.clone() }
+        }
         None => {
-            let body = format!("Landed with `gft land` from the copy `{name}`.");
             let made = github.call(
                 "POST",
                 "pulls",
@@ -109,6 +139,7 @@ pub fn land(store: &Store, repo: &str, name: &str, message: Option<&str>, draft:
                 url: made["html_url"].as_str().unwrap_or_default().to_owned(),
                 branch: branch.clone(),
                 landed_on: copy.base.clone(),
+                landed,
             }
         }
     };
@@ -134,12 +165,42 @@ fn sha(value: &Value) -> Result<String> {
 
 /// The git mode and the contents of the file or link at `path`.
 fn read(path: &Path) -> Result<(&'static str, Vec<u8>)> {
+    let (mode, link) = mode(path)?;
+    match link {
+        Some(target) => Ok((mode, target)),
+        None => Ok((mode, std::fs::read(path).with_context(|| format!("reading {}", path.display()))?)),
+    }
+}
+
+/// The git mode of the file or link at `path`, and a link's target.
+fn mode(path: &Path) -> Result<(&'static str, Option<Vec<u8>>)> {
     use std::os::unix::fs::PermissionsExt;
     let meta = std::fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
     if meta.file_type().is_symlink() {
         let target = std::fs::read_link(path)?;
-        return Ok(("120000", target.as_os_str().as_encoded_bytes().to_vec()));
+        return Ok(("120000", Some(target.as_os_str().as_encoded_bytes().to_vec())));
     }
-    let mode = if meta.permissions().mode() & 0o111 != 0 { "100755" } else { "100644" };
-    Ok((mode, std::fs::read(path).with_context(|| format!("reading {}", path.display()))?))
+    Ok((if meta.permissions().mode() & 0o111 != 0 { "100755" } else { "100644" }, None))
+}
+
+/// What a changed file looked like, so `gft rm` can tell whether it is still what
+/// landed. It is the file's own mode and the git hash of its bytes as landing sends
+/// them, without the repository's filters, not its modification time or the
+/// copy's base: `gft sync` rewrites times and moves the base without touching what
+/// the copy changed, and judging by either would call a landed copy unlanded (or,
+/// the other way, miss an edit made inside the same second as the landing). A file
+/// that `gft sync` merged upstream lines into reads as changed, which it is: landing
+/// again would add a commit.
+pub fn fingerprint(dir: &Path, change: &Change) -> Result<String> {
+    if change.kind == 'D' {
+        return Ok("deleted".to_owned());
+    }
+    let path = dir.join(&change.path);
+    let (mode, link) = mode(&path)?;
+    let hash = match link {
+        // In hex: a link's target is any bytes, and two differing ones must not read the same.
+        Some(target) => target.iter().map(|byte| format!("{byte:02x}")).collect(),
+        None => git(dir, &["hash-object", "--no-filters", "--", &change.path])?,
+    };
+    Ok(format!("{mode} {hash}"))
 }

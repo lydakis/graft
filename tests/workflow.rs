@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -47,6 +47,8 @@ struct Made {
     commits: Vec<Value>,
     refs: BTreeMap<String, String>,
     pulls: Vec<Value>,
+    /// The bodies of PATCH pulls/N, as `(N, body)`.
+    patches: Vec<(u64, Value)>,
 }
 
 /// Answers the calls `gft land` makes, keeping what it was sent.
@@ -134,6 +136,11 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
                     let n = made.pulls.len();
                     (201, json!({"number": n, "html_url": format!("https://github.com/o/n/pull/{n}")}))
                 }
+                ("PATCH", p) if p.starts_with("pulls/") => {
+                    let number: u64 = p["pulls/".len()..].parse().unwrap();
+                    made.patches.push((number, body["body"].clone()));
+                    (200, json!({"number": number}))
+                }
                 _ => (404, json!({"message": format!("no {method} {path}")})),
             };
             drop(made);
@@ -167,6 +174,26 @@ impl Gft {
             .unwrap()
     }
 
+    /// Like `run`, with `input` on standard input.
+    fn run_with_input(&self, dir: &Path, args: &[&str], input: &str) -> String {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_gft"))
+            .current_dir(dir)
+            .env("SANDFS_HOME", self.sandfs_home.path())
+            .env("GRAFT_HOME", self.graft_home.path())
+            .env("GRAFT_GITHUB_API", &self.api)
+            .env("GITHUB_TOKEN", "test-token")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "gft {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    }
+
     fn run(&self, dir: &Path, args: &[&str]) -> String {
         let out = self.try_run(dir, args);
         assert!(out.status.success(), "gft {args:?}: {}", String::from_utf8_lossy(&out.stderr));
@@ -198,7 +225,12 @@ fn copies_are_made_compared_synced_and_landed() {
     std::fs::create_dir(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/lib.rs"), "fn one() {}\n\nfn two() {}\n").unwrap();
     std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "/target\n").unwrap();
+    // A file kept in an ignored folder all the same.
+    std::fs::create_dir(repo.join("target")).unwrap();
+    std::fs::write(repo.join("target/keep"), "kept\n").unwrap();
     git(repo, &["add", "-A"]);
+    git(repo, &["add", "-f", "target/keep"]);
     git(repo, &["commit", "-q", "-m", "first"]);
     let first = git(repo, &["rev-parse", "HEAD"]);
 
@@ -219,14 +251,38 @@ fn copies_are_made_compared_synced_and_landed() {
     std::fs::write(fix.join("src/lib.rs"), "fn one() {}\n\nfn two() { 2 }\n").unwrap();
     std::fs::write(fix.join("notes.txt"), "why\n").unwrap();
     std::fs::write(try_.join("src/lib.rs"), "fn one() { 1 }\n\nfn two() {}\n").unwrap();
+    // Build output git ignores is no change, in either copy or between them.
+    for (copy, built) in [(&fix, "built\n"), (&try_, "built another way\n")] {
+        std::fs::create_dir_all(copy.join("target/debug")).unwrap();
+        std::fs::write(copy.join("target/debug/app"), built).unwrap();
+    }
     assert_eq!(gft.run(&fix, &["changes"]), "A notes.txt\nM src/lib.rs\n");
     assert_eq!(gft.run(&fix, &["changes", "fix", "try"]), "A notes.txt\nM src/lib.rs\n");
+    assert_eq!(gft.run(&fix, &["changes", "--count"]), "1 added, 1 modified, 0 deleted\n");
+    assert_eq!(gft.run(&fix, &["changes", "fix", "try", "--count"]), "1 added, 1 modified, 0 deleted\n");
     let listed = gft.run(&home, &["ls"]);
     assert!(listed.contains("fix\t2 files\tbase ") && listed.contains("overlaps try on src/lib.rs"), "{listed}");
+    // Outside any copy, `ls` lists every project; inside one, just that project.
+    assert_eq!(gft.run(&work, &["ls"]), listed);
+    assert_eq!(gft.run(&work, &["ls"]).matches("(home, main)").count(), 1);
     assert_eq!(gft.run(&home, &["path", "fix"]), format!("{}\n", fix.display()));
+    // A folder replaced by a link: git isn't asked about what was in it, past the link.
+    gft.run(&home, &["new", "link"]);
+    let link = work.join("app+link");
+    std::fs::remove_dir_all(link.join("src")).unwrap();
+    std::os::unix::fs::symlink("elsewhere", link.join("src")).unwrap();
+    assert_eq!(gft.run(&link, &["changes"]), "A src\nD src/lib.rs\n");
+    // A base file deleted with `git rm` is a change, though git ignores its name now.
+    git(&link, &["rm", "-q", "target/keep"]);
+    assert_eq!(gft.run(&link, &["changes"]), "A src\nD src/lib.rs\nD target/keep\n");
+    gft.run(&home, &["rm", "link", "--force"]);
 
     // A snapshot, a wrong turn, and back.
     gft.run(&fix, &["save", "two returns 2"]);
+    let status = gft.run(&fix, &["status"]);
+    assert!(status.contains("copy       fix\n") && status.contains("changed    2 files\n"), "{status}");
+    assert!(status.contains("snapshots  1\n") && !status.contains("pull request"), "{status}");
+    assert_eq!(gft.run(&home, &["status"]).lines().last(), Some("copies   2"));
     std::fs::remove_file(fix.join("notes.txt")).unwrap();
     std::fs::write(fix.join("stray.txt"), "oops\n").unwrap();
     // From inside the copy, with a program working there all along.
@@ -237,6 +293,10 @@ fn copies_are_made_compared_synced_and_landed() {
     shell.kill().unwrap();
     shell.wait().unwrap();
     gft.run(&fix, &["save", "again"]);
+    let listed = gft.run(&home, &["undo", "--list", "--copy", "fix"]);
+    let lines: Vec<&str> = listed.lines().collect();
+    assert!(lines.len() == 2 && lines[0].starts_with("1\t") && lines[1].starts_with("2\t"), "{listed}");
+    assert!(lines[0].ends_with(" sec ago\tagain") && lines[1].ends_with(" sec ago\ttwo returns 2"), "{listed}");
     gft.run(&home, &["undo", "--copy", "fix"]);
 
     // Upstream changes another line of the same file: sync merges it in.
@@ -253,8 +313,9 @@ fn copies_are_made_compared_synced_and_landed() {
     assert_ne!(first, second);
 
     // Landing makes a branch, one commit on the newest base, and a pull request.
-    let landed = gft.run(&fix, &["land", "-m", "Make two return 2"]);
+    let landed = gft.run(&fix, &["land", "-m", "Make two return 2", "--body", "Two now returns 2.\n"]);
     assert!(landed.contains("graft/fix at commit-1, 2 files: https://github.com/o/n/pull/1"), "{landed}");
+    assert!(gft.run(&fix, &["status"]).contains("pull request  https://github.com/o/n/pull/1\n"));
     {
         let made = made.lock().unwrap();
         assert_eq!(made.trees[0]["base_tree"], format!("tree-of-{second}"));
@@ -265,6 +326,7 @@ fn copies_are_made_compared_synced_and_landed() {
         assert_eq!(made.refs["heads/graft/fix"], "commit-1");
         assert_eq!(made.pulls[0]["base"], "main");
         assert_eq!(made.pulls[0]["title"], "Make two return 2");
+        assert_eq!(made.pulls[0]["body"], "Two now returns 2.\n\nLanded with `gft land` from the copy `fix`.");
     }
     // Landing again adds a commit to the same pull request.
     std::fs::write(fix.join("notes.txt"), "why, and how\n").unwrap();
@@ -276,16 +338,67 @@ fn copies_are_made_compared_synced_and_landed() {
         assert_eq!(made.commits[1]["parents"], json!(["commit-1"]));
         assert_eq!(made.commits[1]["message"], "Update fix");
         assert_eq!(made.refs["heads/graft/fix"], "commit-2");
+        // No body given: the description on GitHub is left alone.
+        assert!(made.patches.is_empty());
     }
+    // A body given on a later landing updates the pull request, from a file or stdin.
+    std::fs::write(fix.join("notes.txt"), "why, how, and when\n").unwrap();
+    let described = work.join("description.md");
+    std::fs::write(&described, "From a file.\n").unwrap();
+    gft.run(&fix, &["land", "--body-file", described.to_str().unwrap()]);
+    std::fs::write(fix.join("notes.txt"), "why, how, when, and who\n").unwrap();
+    gft.run_with_input(&fix, &["land", "--body-file", "-"], "From stdin.\n\nWith two paragraphs.\n");
+    {
+        let made = made.lock().unwrap();
+        assert_eq!(made.pulls.len(), 1);
+        let footer = "\n\nLanded with `gft land` from the copy `fix`.";
+        assert_eq!(made.patches[0], (1, json!(format!("From a file.{footer}"))));
+        assert_eq!(made.patches[1], (1, json!(format!("From stdin.\n\nWith two paragraphs.{footer}"))));
+    }
+    let both = gft.try_run(&fix, &["land", "--body", "a", "--body-file", "-"]);
+    assert!(!both.status.success());
     let unchanged = gft.try_run(&fix, &["land"]);
     assert!(String::from_utf8_lossy(&unchanged.stderr).contains("nothing new to land"));
+    // With nothing new but a description, only the description changes.
+    let redescribed = gft.run(&fix, &["land", "--body", "Only words."]);
+    assert!(redescribed.contains("described it anew"), "{redescribed}");
+    {
+        let made = made.lock().unwrap();
+        assert_eq!(made.patches[2], (1, json!("Only words.\n\nLanded with `gft land` from the copy `fix`.")));
+        assert_eq!(made.refs["heads/graft/fix"], "commit-4", "no new commit");
+    }
 
     // A copy of a copy starts with its changes and lands on top of its branch.
     gft.run(&home, &["new", "more", "--from", "fix"]);
     let more = work.join("app+more");
-    assert_eq!(std::fs::read_to_string(more.join("notes.txt")).unwrap(), "why, and how\n");
+    assert_eq!(std::fs::read_to_string(more.join("notes.txt")).unwrap(), "why, how, when, and who\n");
 
-    gft.run(&home, &["rm", "try", "more"]);
+    // Copy names that are missing, taken or invalid are refused plainly.
+    let missing = String::from_utf8_lossy(&gft.try_run(&home, &["path", "nope"]).stderr).into_owned();
+    assert!(missing.contains("has no copy \"nope\"; its copies are: ") && missing.contains("fix"), "{missing}");
+    let taken = String::from_utf8_lossy(&gft.try_run(&home, &["new", "fix"]).stderr).into_owned();
+    assert!(taken.contains("already has a copy \"fix\"; pick another name"), "{taken}");
+    let bad = String::from_utf8_lossy(&gft.try_run(&home, &["new", "two words"]).stderr).into_owned();
+    assert!(bad.contains("invalid copy name \"two words\""), "{bad}");
+
+    // Changes that never landed are not thrown away, unless asked: `try` was never
+    // landed, `more` carries `fix`'s changes without a pull request of its own.
+    let kept = gft.try_run(&home, &["rm", "try", "more"]);
+    assert!(!kept.status.success());
+    let said = String::from_utf8_lossy(&kept.stderr);
+    assert!(said.contains("try has 1 file that never landed") && said.contains("more has 2 files"), "{said}");
+    assert!(gft.run(&home, &["ls"]).contains("try"));
+    // A landed copy goes without --force, even after a sync moved its base; an edit
+    // since the landing, or one reverted, is what counts.
+    std::fs::write(repo.join("CHANGES.md"), "- one\n- two\n").unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-q", "-m", "third"]);
+    gft.run(&fix, &["sync"]);
+    std::fs::write(fix.join("notes.txt"), "edited after landing\n").unwrap();
+    let edited = gft.try_run(&home, &["rm", "fix"]);
+    assert!(String::from_utf8_lossy(&edited.stderr).contains("fix has 1 file that never landed"));
+    std::fs::write(fix.join("notes.txt"), "why, how, when, and who\n").unwrap();
+    gft.run(&home, &["rm", "fix"]);
+    gft.run(&home, &["rm", "--force", "try", "more"]);
     assert!(!gft.run(&home, &["ls"]).contains("try"));
-    assert!(gft.try_run(&home, &["path", "try"]).stderr.ends_with(b"`gft ls` lists them\n"));
 }

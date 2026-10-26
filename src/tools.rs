@@ -1,5 +1,7 @@
 //! The programs Graft drives: `sandfs` for the files and `git` for reading commits.
 
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -37,14 +39,17 @@ pub struct Change {
     pub path: String,
 }
 
-/// The files the workspace `name` changed, or how it differs from `since`.
-pub fn changes(name: &str, since: Option<&str>) -> Result<Vec<Change>> {
+/// The files the workspace `name` changed, or how it differs from `since`, leaving out
+/// what git ignores in the copy at `dir`, such as build output: those are no change
+/// anyone means to land.
+pub fn changes(name: &str, since: Option<&str>, dir: &Path) -> Result<Vec<Change>> {
     let mut args = vec!["changes", name];
     if let Some(since) = since {
         args.extend(["--since", since]);
     }
     let (out, _) = sandfs(&args)?;
-    out.lines()
+    let all = out
+        .lines()
         .filter(|line| !line.is_empty())
         .map(|line| match line.split_once(' ') {
             Some((kind, path)) if kind.len() == 1 => {
@@ -52,7 +57,65 @@ pub fn changes(name: &str, since: Option<&str>) -> Result<Vec<Change>> {
             }
             _ => bail!("unexpected line from sandfs changes: {line:?}"),
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    // Against the base, only an added file can be one git ignores: the others are the
+    // base commit's own files, whatever the index says after `git rm`. Between copies,
+    // either may have build output the other lacks. A path below a link, as a deleted
+    // file is when a link replaced its folder, is no file git could ignore, and git
+    // refuses to look past the link.
+    let mut links = HashMap::new();
+    let mut below_link = |path: &str| {
+        Path::new(path).ancestors().skip(1).filter(|parent| !parent.as_os_str().is_empty()).any(|parent| {
+            *links.entry(parent.to_path_buf()).or_insert_with(|| {
+                std::fs::symlink_metadata(dir.join(parent)).is_ok_and(|meta| meta.file_type().is_symlink())
+            })
+        })
+    };
+    let asked: Vec<&str> = all
+        .iter()
+        .filter(|change| since.is_some() || change.kind == 'A')
+        .map(|change| change.path.as_str())
+        .filter(|path| !below_link(path))
+        .collect();
+    let ignored = ignored(dir, asked.into_iter())?;
+    Ok(all.into_iter().filter(|change| !ignored.contains(&change.path)).collect())
+}
+
+/// Which of `paths` git ignores in the copy at `dir`. Files git tracks never are. A
+/// copy that isn't mounted can't say, so nothing is.
+fn ignored<'a>(dir: &Path, paths: impl Iterator<Item = &'a str>) -> Result<HashSet<String>> {
+    let input: Vec<u8> = paths.flat_map(|path| path.bytes().chain([0])).collect();
+    if input.is_empty() || !dir.join(".git").exists() {
+        return Ok(HashSet::new());
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["check-ignore", "--stdin", "-z"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running git")?;
+    let mut stdin = child.stdin.take().expect("piped");
+    // Written from a thread of its own, so a long answer can't block the writing.
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let output = child.wait_with_output().context("running git check-ignore")?;
+    writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("writing to git check-ignore"))?
+        .context("writing to git check-ignore")?;
+    // 1: nothing is ignored.
+    if !output.status.success() && output.status.code() != Some(1) {
+        bail!("git check-ignore failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(output
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect())
 }
 
 /// Where the workspace `name` is mounted, if it is.

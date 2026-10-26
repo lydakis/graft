@@ -61,6 +61,9 @@ pub struct Pr {
     pub branch: String,
     /// The base commit the last landing was made on.
     pub landed_on: String,
+    /// Each file the last landing carried, as `fingerprint` saw it, for `gft rm`.
+    #[serde(default)]
+    pub landed: BTreeMap<String, String>,
 }
 
 /// A copy as it was at one moment, kept as an unmounted sandfs workspace.
@@ -172,9 +175,59 @@ impl Store {
 
 /// Copy names become folder and workspace names.
 pub fn check_copy_name(name: &str) -> Result<()> {
-    let ok = !name.is_empty()
-        && name.len() <= 60
-        && !name.starts_with(['-', '_'])
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c));
-    if ok { Ok(()) } else { bail!("invalid copy name {name:?}: use letters, digits, '_' and '-'") }
+    if name.is_empty() {
+        bail!("a copy needs a name; give letters, digits, '_' or '-'");
+    }
+    if let Some(c) = name.chars().find(|c| !(c.is_ascii_alphanumeric() || "_-".contains(*c))) {
+        bail!("invalid copy name {name:?}: {c:?} isn't allowed; use only letters, digits, '_' and '-'");
+    }
+    if name.starts_with(['-', '_']) {
+        bail!("invalid copy name {name:?}: it can't start with '-' or '_'; start with a letter or digit");
+    }
+    if name.len() > 60 {
+        bail!("invalid copy name {name:?}: {} characters is too long; use at most 60", name.len());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_copy_name;
+
+    fn refusal(name: &str) -> String {
+        check_copy_name(name).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn good_copy_names_pass() {
+        for name in ["a", "fix-bug", "fix_bug", "Fix2", "9lives", &"x".repeat(60)] {
+            assert!(check_copy_name(name).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn empty_name_is_refused() {
+        assert!(refusal("").contains("needs a name"));
+    }
+
+    #[test]
+    fn characters_other_than_letters_digits_dash_and_underscore_are_refused() {
+        assert!(refusal("two words").contains("' ' isn't allowed"));
+        assert!(refusal("a/b").contains("'/' isn't allowed"));
+        assert!(refusal("a.b").contains("'.' isn't allowed"));
+        assert!(refusal("caf\u{e9}").contains("isn't allowed"));
+    }
+
+    #[test]
+    fn leading_dash_or_underscore_is_refused() {
+        assert!(refusal("-x").contains("can't start with"));
+        assert!(refusal("_x").contains("can't start with"));
+        assert!(check_copy_name("x-").is_ok());
+    }
+
+    #[test]
+    fn names_over_sixty_characters_are_refused() {
+        assert!(check_copy_name(&"x".repeat(60)).is_ok());
+        assert!(refusal(&"x".repeat(61)).contains("61 characters is too long"));
+    }
 }
