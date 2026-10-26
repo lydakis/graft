@@ -641,7 +641,7 @@ dependencies = [
 [[package]]
 name = "sandfs"
 version = "0.6.0"
-source = "git+https://github.com/lydakis/sandfs?branch=claude%2Fproject-thread-wdmsae#1de05f7a015cd284c1f103a151dd2a3568f9e8d7"
+source = "git+https://github.com/lydakis/sandfs?branch=main#3fefc8aec8d368416cfc7b46867f9a85dbb4a8a3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -666,7 +666,7 @@ dependencies = [
 [[package]]
 name = "sandfs-core"
 version = "0.6.0"
-source = "git+https://github.com/lydakis/sandfs?branch=claude%2Fproject-thread-wdmsae#1de05f7a015cd284c1f103a151dd2a3568f9e8d7"
+source = "git+https://github.com/lydakis/sandfs?branch=main#3fefc8aec8d368416cfc7b46867f9a85dbb4a8a3"
 dependencies = [
  "bytes",
  "imbl",
@@ -677,7 +677,7 @@ dependencies = [
 [[package]]
 name = "sandfs-git"
 version = "0.6.0"
-source = "git+https://github.com/lydakis/sandfs?branch=claude%2Fproject-thread-wdmsae#1de05f7a015cd284c1f103a151dd2a3568f9e8d7"
+source = "git+https://github.com/lydakis/sandfs?branch=main#3fefc8aec8d368416cfc7b46867f9a85dbb4a8a3"
 dependencies = [
  "bytes",
  "sandfs-core",
@@ -686,7 +686,7 @@ dependencies = [
 [[package]]
 name = "sandfs-mcp"
 version = "0.6.0"
-source = "git+https://github.com/lydakis/sandfs?branch=claude%2Fproject-thread-wdmsae#1de05f7a015cd284c1f103a151dd2a3568f9e8d7"
+source = "git+https://github.com/lydakis/sandfs?branch=main#3fefc8aec8d368416cfc7b46867f9a85dbb4a8a3"
 dependencies = [
  "base64 0.23.1",
  "globset",
