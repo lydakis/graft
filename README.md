@@ -102,7 +102,7 @@ gft rm cleanup
 
 ## Needs
 
-- A `sandfs` that moves a mounted workspace in place (lydakis/sandfs#166; until it ships in a release, `cargo install --git https://github.com/lydakis/sandfs sandfs-cli`), and what it needs to mount: FUSE 3 on Linux, nothing on macOS.
+- A `sandfs` newer than 0.6.0, which moves a mounted workspace in place (until the next release, `cargo install --git https://github.com/lydakis/sandfs sandfs-cli`), and what it needs to mount: FUSE 3 on Linux, nothing on macOS.
 - `git` and `curl`.
 - A GitHub token for `land`: `GITHUB_TOKEN` or `GH_TOKEN`, else whatever `gh auth token` gives (see [Configuration](#configuration)).
 
