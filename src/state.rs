@@ -20,8 +20,15 @@ use serde::{Deserialize, Serialize};
 /// A repository or a plain folder Graft works on, with its copies.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
-    /// `owner/name` on GitHub, where copies land; `folder/name` for a plain folder.
+    /// The project's name, as commands take it: `owner/name` for a repository,
+    /// `folder/name` for a plain folder.
     pub repo: String,
+    /// Where copies land: the URL `git push` goes to. Empty for a plain folder.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub remote: String,
+    /// The forge that keeps review requests for the remote, if it has one Graft knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<crate::forge::Spec>,
     /// What sandfs mounts: the repository's URL, or the folder or checkout.
     pub source: String,
     /// The home copy's folder, which tracks the default branch; for a plain folder or
@@ -32,7 +39,7 @@ pub struct Project {
     /// The default branch, which copies land onto; empty for a plain folder.
     pub branch: String,
     /// Whether the project is a plain folder, which copies land back into, rather than
-    /// a repository on GitHub.
+    /// a repository on a remote.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub folder: bool,
     /// Whether the home copy is a git checkout on this machine, which copies start
@@ -56,7 +63,7 @@ pub struct Project {
 ///
 /// Three things say where a copy stands, and each answers one question: `base` is
 /// what its files start from, `stacked` is the landed work it was made on top of,
-/// and `landed` is what it last put on GitHub. Landing builds on all three, so it
+/// and `landed` is what it last put on the remote. Landing builds on all three, so it
 /// never undoes what it doesn't know about.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Copy {
@@ -71,19 +78,19 @@ pub struct Copy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     /// The landing it was made on top of: when it was made from a copy that had
-    /// landed, that copy's landing as it was then. Its pull request is based on that
+    /// landed, that copy's landing as it was then. Its review request is based on that
     /// branch, and its first commit follows that landing rather than the branch's
     /// newest commit, which the copy's files don't have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stacked: Option<Landing>,
-    /// What its last landing put on GitHub.
+    /// What its last landing put on the remote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landed: Option<Landing>,
     /// A landing whose commit is made but whose branch may not have moved to it yet,
     /// kept until it has, so landing again after one cut short knows its own commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<Landing>,
-    /// Its pull request, once made.
+    /// Its pull or merge request, once made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr: Option<Pr>,
     /// Files `gft sync` left with conflict markers, which `land` refuses until they
@@ -97,10 +104,10 @@ pub struct Copy {
     pub next: u64,
 }
 
-/// A copy's changes as a landing left them on GitHub.
+/// A copy's changes as a landing left them on the remote.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Landing {
-    /// The branch on GitHub.
+    /// The branch on the remote.
     pub branch: String,
     /// The commit the landing left the branch at.
     pub commit: String,
@@ -134,9 +141,23 @@ impl Pr {
 /// A project as read from its file, with a landing that Graft before 0.1 kept with
 /// the pull request moved to where it is kept now. That Graft didn't keep the commit
 /// it left the branch at, so the commit is left empty, for `land` to take the
-/// branch's as the copy's own.
+/// branch's as the copy's own. Graft before 0.3 landed on GitHub alone, through its
+/// API, and kept no remote: such a project lands on its repository there.
+/// The GitHub that Graft before 0.3 landed on, from the API it was given: GitHub
+/// Enterprise's is on the server itself.
+fn github_host(api: &str) -> String {
+    crate::remote::host_of(api.trim_end_matches('/'))
+        .filter(|host| host != "api.github.com")
+        .unwrap_or_else(|| "github.com".to_owned())
+}
+
 fn read(data: &[u8]) -> serde_json::Result<Project> {
     let mut project: Project = serde_json::from_slice(data)?;
+    if !project.folder && project.remote.is_empty() {
+        let host = github_host(&std::env::var("GRAFT_GITHUB_API").unwrap_or_default());
+        project.remote = format!("https://{host}/{}", project.repo);
+        project.forge = crate::forge::Spec::new(crate::forge::Kind::GitHub, &host, &project.repo);
+    }
     for copy in project.copies.values_mut() {
         let Some(pr) = &mut copy.pr else { continue };
         if let (Some(branch), Some(on), None) = (pr.old_branch.take(), pr.old_on.take(), &copy.landed) {
@@ -306,7 +327,7 @@ pub fn check_copy_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::check_copy_name;
+    use super::{check_copy_name, github_host};
 
     #[test]
     fn a_landing_kept_with_the_pull_request_moves_to_the_copy() {
@@ -358,5 +379,13 @@ mod tests {
     fn names_over_sixty_characters_are_refused() {
         assert!(check_copy_name(&"x".repeat(60)).is_ok());
         assert!(refusal(&"x".repeat(61)).contains("61 characters is too long"));
+    }
+
+    #[test]
+    fn projects_before_remotes_land_where_their_api_was() {
+        assert_eq!(github_host(""), "github.com");
+        assert_eq!(github_host("https://api.github.com/"), "github.com");
+        assert_eq!(github_host("https://ghe.example.com/api/v3"), "ghe.example.com");
+        assert_eq!(github_host("https://ghe.example.com:8443/api/v3"), "ghe.example.com:8443");
     }
 }

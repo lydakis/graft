@@ -46,5 +46,5 @@ The advantage grows with the repository. On VS Code (sandfs measurements, 2026-1
 
 ## Not measured here
 
-- **Time to a real pull request.** `gft land` makes 4 calls to GitHub's API plus one per changed file, then one more to open the pull request. A worktree needs `git commit`, `git push` and `gh pr create`. The test suite checks landing against a stand-in for the API, not GitHub itself.
+- **Time to a real pull request.** `gft land` builds one commit from the copy's files and pushes it, as a worktree's `git commit` and `git push` would, then opens the pull request with one or two calls to the forge's API instead of `gh pr create`. On GitHub (2026-10-27, from a cloud machine, 6 files changed) a landing took 2.2 to 2.8 s: 0.4 s to read the remote's `graft/*` branches, about 0.2 s to build the commit, and 1.7 s for the push itself. The test suite checks landing against a local remote and a stand-in for the GitHub and GitLab APIs.
 - **Recovery after an interrupted landing.** Running `gft land` again finishes it without a second commit or pull request (see the tests). With git, you run `git push` or `gh pr create` again.
