@@ -1,6 +1,6 @@
 [package]
 name = "graft"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Work in fast copies of a GitHub repository that share its files, fetched as read, built on sandfs; each copy lands as a pull request"
 license = "MIT"
