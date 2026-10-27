@@ -197,7 +197,15 @@ impl Forge {
             (Kind::GitLab, _) => format!("merge_requests?source_branch={}&state=merged", query(branch)),
         };
         let found = self.call("GET", &path, None)?;
-        found.as_array().map(Vec::as_slice).unwrap_or_default().iter().map(|one| self.review(one)).collect()
+        found
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            // GitLab matches the branch's name in forks too; only the project's own counts.
+            .filter(|one| self.kind != Kind::GitLab || one["source_project_id"] == one["project_id"])
+            .map(|one| self.review(one))
+            .collect()
     }
 
     /// Open a review request from `head` against `base`.

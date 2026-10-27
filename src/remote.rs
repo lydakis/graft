@@ -252,10 +252,8 @@ fn commit_with(
         }
     }
     if !files.is_empty() {
-        let paths: Vec<u8> = files.iter().flat_map(|(_, path)| path.bytes().chain(*b"\n")).collect();
-        if files.iter().any(|(_, path)| path.contains('\n')) {
-            bail!("a file name with a line break in it can't be landed");
-        }
+        let paths: Vec<u8> =
+            files.iter().flat_map(|(_, path)| quoted(path).into_bytes().into_iter().chain(*b"\n")).collect();
         let ids = git(&["hash-object", "-w", "--no-filters", "--stdin-paths"], Some(&paths))?;
         for ((mode, path), id) in files.iter().zip(ids.lines()) {
             entries.extend_from_slice(format!("{mode} {id}\t{path}\0").as_bytes());
@@ -285,6 +283,29 @@ fn temp_path(what: &str) -> PathBuf {
     std::env::temp_dir().join(format!("graft-{what}-{}-{n}", std::process::id()))
 }
 
+/// `path` as `git hash-object --stdin-paths` reads it: as it is, unless git would take
+/// it for a quoted name (it starts with `"`) or it has a line break, then quoted as C
+/// quotes strings.
+fn quoted(path: &str) -> String {
+    if !path.starts_with('"') && !path.contains(['\n', '\r']) {
+        return path.to_owned();
+    }
+    let mut quoted = String::from("\"");
+    for byte in path.bytes() {
+        match byte {
+            b'"' => quoted.push_str("\\\""),
+            b'\\' => quoted.push_str("\\\\"),
+            b'\n' => quoted.push_str("\\n"),
+            b'\r' => quoted.push_str("\\r"),
+            b'\t' => quoted.push_str("\\t"),
+            byte if !(0x20..0x7f).contains(&byte) => quoted.push_str(&format!("\\{byte:03o}")),
+            byte => quoted.push(byte as char),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +322,13 @@ mod tests {
     fn remote_lines_with_links_are_kept() {
         let said = said(b"remote: \nremote: To create a merge request for x, visit:\nremote:   https://gitlab.com/g/n/-/merge_requests/new?x\nTo https://gitlab.com/g/n\n");
         assert_eq!(said, ["https://gitlab.com/g/n/-/merge_requests/new?x"]);
+    }
+
+    #[test]
+    fn names_git_would_unquote_are_quoted() {
+        assert_eq!(quoted("plain name.txt"), "plain name.txt");
+        assert_eq!(quoted("a\"b"), "a\"b");
+        assert_eq!(quoted("\"normal\""), "\"\\\"normal\\\"\"");
+        assert_eq!(quoted("two\nlines\\é"), "\"two\\nlines\\\\\\303\\251\"");
     }
 }

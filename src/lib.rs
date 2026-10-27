@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
-use crate::state::{Copy, Landing, Project, Snapshot, Store, check_copy_name};
+use crate::state::{Copy, Project, Snapshot, Store, check_copy_name};
 use crate::tools::{changes, copy_changes, ensure_mounted, fork, git, mount, mounted, path_str, sandfs, short};
 
 #[derive(Parser)]
@@ -844,7 +844,8 @@ fn new(store: &Store, names: &[String], from: Option<(&str, bool)>) -> Result<()
                 if landed.commit.is_empty() {
                     bail!("land {name} once more first: Graft before 0.1 didn't keep which commit it landed");
                 }
-                stacked = Some(Landing { files: BTreeMap::new(), ..landed.clone() });
+                // Its files too: with no forge to ask, they are how sync tells it was merged.
+                stacked = Some(landed.clone());
             }
             (from.workspace.clone(), Some(from.base.clone()))
         }

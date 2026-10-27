@@ -281,7 +281,8 @@ fn merge_request_json(made: &Made, n: usize) -> Value {
         (Some("open"), _) => "opened",
         _ => "closed",
     };
-    json!({"iid": n, "web_url": format!("https://gitlab.com/o/n/-/merge_requests/{n}"), "state": state,
+    let source = if made.pulls[n - 1]["fork"] == true { 8 } else { 7 };
+    json!({"iid": n, "project_id": 7, "source_project_id": source, "web_url": format!("https://gitlab.com/o/n/-/merge_requests/{n}"), "state": state,
         "source_branch": pull["head"]["ref"], "target_branch": pull["base"]["ref"], "sha": pull["head"]["sha"],
         "merge_commit_sha": pull["merge_commit_sha"], "title": made.pulls[n - 1]["title"],
         "description": made.pulls[n - 1]["body"]})
@@ -1412,33 +1413,57 @@ fn any_remote_takes_landings_and_gitlab_takes_merge_requests() {
     let removed = gft.run(&home, &["rm", "--delete-branch", "gone"]);
     assert!(removed.contains("gone: deleted branch graft/gone"), "{removed}");
     assert!(!branches(repo).contains_key("graft/gone"));
+
+    // Built on a landing, with no forge: once main has that landing's files, sync
+    // takes it in as merged, without conflicting with its own edits.
+    gft.run(&home, &["new", "base"]);
+    std::fs::write(work.join("plain+base/added.txt"), "added\n").unwrap();
+    gft.run(&work.join("plain+base"), &["land"]);
+    gft.run(&home, &["new", "top", "--on", "base"]);
+    std::fs::write(work.join("plain+top/added.txt"), "added, and more\n").unwrap();
+    commit_upstream(repo, "added.txt", "added\n");
+    let synced = gft.run(&work.join("plain+top"), &["sync"]);
+    assert!(synced.contains("graft/base was merged (main has its files); top now builds on main"), "{synced}");
+    assert!(!synced.contains("conflict"), "{synced}");
+    assert_eq!(gft.run(&work.join("plain+top"), &["changes"]), "M added.txt\n");
+    // A name git would read as quoted lands as itself.
+    gft.run(&home, &["new", "quote"]);
+    std::fs::write(work.join("plain+quote/normal"), "plain\n").unwrap();
+    std::fs::write(work.join("plain+quote/\"normal\""), "quoted\n").unwrap();
+    gft.run(&work.join("plain+quote"), &["land"]);
+    let quote = branch(repo, "graft/quote");
+    assert_eq!(file_at(repo, &quote, "\"normal\"").unwrap(), "quoted\n");
+    assert_eq!(file_at(repo, &quote, "normal").unwrap(), "plain\n");
+
     gft.run(&work, &["drop", "plain", "--force"]);
 
     // GitLab: the same landing, with a merge request.
     gft.run(&work, &["get", &url, "lab", "--forge", "gitlab:o/n"]);
     let home = work.join("lab");
+    // A fork's open merge request from a branch of the same name isn't this copy's.
+    made.lock().unwrap().pulls.push(json!({"head": "graft/notes", "base": "main", "title": "fork", "fork": true}));
     gft.run(&home, &["new", "notes"]);
     let notes = work.join("lab+notes");
     std::fs::write(notes.join("notes.txt"), "notes\n").unwrap();
     let landed = gft.run(&notes, &["land", "-m", "Add notes", "--draft"]);
-    assert!(landed.contains("https://gitlab.com/o/n/-/merge_requests/1"), "{landed}");
+    assert!(landed.contains("https://gitlab.com/o/n/-/merge_requests/2"), "{landed}");
     {
         let made = made.lock().unwrap();
-        assert_eq!(made.pulls[0]["title"], "Draft: Add notes");
-        assert_eq!(made.pulls[0]["base"], "main");
+        assert_eq!(made.pulls[1]["title"], "Draft: Add notes");
+        assert_eq!(made.pulls[1]["base"], "main");
     }
     let preview = gft.run(&notes, &["land", "-n"]);
-    assert!(preview.contains("merge request https://gitlab.com/o/n/-/merge_requests/1 (updated)"), "{preview}");
+    assert!(preview.contains("merge request https://gitlab.com/o/n/-/merge_requests/2 (updated)"), "{preview}");
     std::fs::write(notes.join("notes.txt"), "notes, more\n").unwrap();
     gft.run(&notes, &["land", "--body", "More."]);
-    assert_eq!(made.lock().unwrap().patches, [(1, json!("More.\n\nLanded with `gft land` from the copy `notes`."))]);
+    assert_eq!(made.lock().unwrap().patches, [(2, json!("More.\n\nLanded with `gft land` from the copy `notes`."))]);
     // Merged there: sync says so, and landing after starts a new merge request.
     let merge = commit_upstream(repo, "notes.txt", "notes, more\n");
-    merge_pull(&mut made.lock().unwrap(), 1, &merge);
+    merge_pull(&mut made.lock().unwrap(), 2, &merge);
     let synced = gft.run(&notes, &["sync"]);
-    assert!(synced.contains("merge request #1 was merged; notes lands next as a new one"), "{synced}");
+    assert!(synced.contains("merge request #2 was merged; notes lands next as a new one"), "{synced}");
     std::fs::write(notes.join("notes.txt"), "notes, more, again\n").unwrap();
     let landed = gft.run(&notes, &["land"]);
-    assert!(landed.contains("graft/notes-2 at ") && landed.contains("merge_requests/2"), "{landed}");
+    assert!(landed.contains("graft/notes-2 at ") && landed.contains("merge_requests/3"), "{landed}");
     assert_eq!(parents(repo, &branch(repo, "graft/notes-2")), [merge]);
 }
