@@ -574,15 +574,6 @@ fn host_and_path(repo: &str) -> Option<(&str, &str)> {
     Some((host, path.split(['?', '#']).next()?))
 }
 
-/// The port an `http://` or `https://` repository URL names, if it names one.
-fn web_port(repo: &str) -> Option<&str> {
-    let rest = repo.strip_prefix("https://").or_else(|| repo.strip_prefix("http://"))?;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let port = authority.rsplit('@').next()?.split_once(':')?.1;
-    let default = if repo.starts_with("https") { "443" } else { "80" };
-    (!port.is_empty() && port != default && port.bytes().all(|byte| byte.is_ascii_digit())).then_some(port)
-}
-
 /// Where a repository lands, as `gft get` was told: its URL, the project's name (the
 /// last two parts of its path, as `owner/name`), and its forge.
 #[derive(Debug)]
@@ -614,7 +605,7 @@ fn parse_repo(repo: &str, forge: Option<&str>) -> Result<Target> {
     let known = ["github.com", "www.github.com", "gitlab.com"].contains(&host.to_ascii_lowercase().as_str());
     // A forge's API is on the web server: the port of an https:// URL is its port too,
     // where an ssh:// URL's is not.
-    let web_host = match web_port(repo) {
+    let web_host = match remote::web_port(repo) {
         Some(port) => format!("{host}:{port}"),
         None => host.to_owned(),
     };

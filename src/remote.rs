@@ -166,14 +166,31 @@ fn has(dir: &Path, commit: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// The host of a remote URL: `https://host/…`, `ssh://user@host:port/…`, `user@host:…`.
+/// The port an `http://` or `https://` repository URL names, if it names one.
+pub fn web_port(repo: &str) -> Option<&str> {
+    let rest = repo.strip_prefix("https://").or_else(|| repo.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let port = authority.rsplit('@').next()?.split_once(':')?.1;
+    let default = if repo.starts_with("https") { "443" } else { "80" };
+    (!port.is_empty() && port != default && port.bytes().all(|byte| byte.is_ascii_digit())).then_some(port)
+}
+
+/// The host of a remote URL (`https://host/…`, `ssh://user@host:port/…`,
+/// `user@host:…`) as a forge's is kept: with the port of a web server on one other
+/// than the usual, without `www.`.
 pub fn host_of(url: &str) -> Option<String> {
     let authority = match url.split_once("://") {
         Some((_, rest)) => rest.split('/').next()?,
         None => url.split_once(':')?.0,
     };
     let host = authority.rsplit('@').next()?.split(':').next()?;
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    let host = host.to_ascii_lowercase();
+    let host = host.trim_start_matches("www.");
+    match web_port(url) {
+        _ if host.is_empty() => None,
+        Some(port) => Some(format!("{host}:{port}")),
+        None => Some(host.to_owned()),
+    }
 }
 
 /// The id of the tree of `commit`, as the copy at `dir` has it or can fetch it.
@@ -316,6 +333,9 @@ mod tests {
         assert_eq!(host_of("ssh://git@Git.Example.com:2222/o/n.git").as_deref(), Some("git.example.com"));
         assert_eq!(host_of("git@gitlab.com:group/name.git").as_deref(), Some("gitlab.com"));
         assert_eq!(host_of("file:///srv/repo").as_deref(), None);
+        assert_eq!(host_of("https://Git.Example.com:8443/o/n").as_deref(), Some("git.example.com:8443"));
+        assert_eq!(host_of("https://git.example.com:443/o/n").as_deref(), Some("git.example.com"));
+        assert_eq!(host_of("https://www.github.com/o/n").as_deref(), Some("github.com"));
     }
 
     #[test]

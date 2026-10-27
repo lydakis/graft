@@ -143,11 +143,20 @@ impl Pr {
 /// it left the branch at, so the commit is left empty, for `land` to take the
 /// branch's as the copy's own. Graft before 0.3 landed on GitHub alone, through its
 /// API, and kept no remote: such a project lands on its repository there.
+/// The GitHub that Graft before 0.3 landed on, from the API it was given: GitHub
+/// Enterprise's is on the server itself.
+fn github_host(api: &str) -> String {
+    crate::remote::host_of(api.trim_end_matches('/'))
+        .filter(|host| host != "api.github.com")
+        .unwrap_or_else(|| "github.com".to_owned())
+}
+
 fn read(data: &[u8]) -> serde_json::Result<Project> {
     let mut project: Project = serde_json::from_slice(data)?;
     if !project.folder && project.remote.is_empty() {
-        project.remote = format!("https://github.com/{}", project.repo);
-        project.forge = crate::forge::Spec::new(crate::forge::Kind::GitHub, "github.com", &project.repo);
+        let host = github_host(&std::env::var("GRAFT_GITHUB_API").unwrap_or_default());
+        project.remote = format!("https://{host}/{}", project.repo);
+        project.forge = crate::forge::Spec::new(crate::forge::Kind::GitHub, &host, &project.repo);
     }
     for copy in project.copies.values_mut() {
         let Some(pr) = &mut copy.pr else { continue };
@@ -318,7 +327,7 @@ pub fn check_copy_name(name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::check_copy_name;
+    use super::{check_copy_name, github_host};
 
     #[test]
     fn a_landing_kept_with_the_pull_request_moves_to_the_copy() {
@@ -370,5 +379,13 @@ mod tests {
     fn names_over_sixty_characters_are_refused() {
         assert!(check_copy_name(&"x".repeat(60)).is_ok());
         assert!(refusal(&"x".repeat(61)).contains("61 characters is too long"));
+    }
+
+    #[test]
+    fn projects_before_remotes_land_where_their_api_was() {
+        assert_eq!(github_host(""), "github.com");
+        assert_eq!(github_host("https://api.github.com/"), "github.com");
+        assert_eq!(github_host("https://ghe.example.com/api/v3"), "ghe.example.com");
+        assert_eq!(github_host("https://ghe.example.com:8443/api/v3"), "ghe.example.com:8443");
     }
 }
