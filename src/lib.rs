@@ -574,6 +574,15 @@ fn host_and_path(repo: &str) -> Option<(&str, &str)> {
     Some((host, path.split(['?', '#']).next()?))
 }
 
+/// The port an `http://` or `https://` repository URL names, if it names one.
+fn web_port(repo: &str) -> Option<&str> {
+    let rest = repo.strip_prefix("https://").or_else(|| repo.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let port = authority.rsplit('@').next()?.split_once(':')?.1;
+    let default = if repo.starts_with("https") { "443" } else { "80" };
+    (!port.is_empty() && port != default && port.bytes().all(|byte| byte.is_ascii_digit())).then_some(port)
+}
+
 /// Where a repository lands, as `gft get` was told: its URL, the project's name (the
 /// last two parts of its path, as `owner/name`), and its forge.
 #[derive(Debug)]
@@ -603,8 +612,14 @@ fn parse_repo(repo: &str, forge: Option<&str>) -> Result<Target> {
         }
     };
     let known = ["github.com", "www.github.com", "gitlab.com"].contains(&host.to_ascii_lowercase().as_str());
+    // A forge's API is on the web server: the port of an https:// URL is its port too,
+    // where an ssh:// URL's is not.
+    let web_host = match web_port(repo) {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    };
     let forge = match forge {
-        Some(text) => spec_from(text, Some(host), Some(path))?,
+        Some(text) => spec_from(text, Some(&web_host), Some(path))?,
         None if known => {
             Some(forge::Spec::of_host(host, path).with_context(|| format!("can't tell the repository in {repo}"))?)
         }
@@ -1975,6 +1990,11 @@ mod tests {
         assert!(parse("https://github.com/lydakis/sandfs", Some("none")).forge.is_none());
         let bare = parse("ssh://host.example.com/sandfs.git", None);
         assert_eq!(bare.slug, "host.example.com/sandfs");
+        // A web server's port is its API's too; an ssh port is not.
+        let host = |url: &str| parse(url, Some("gitlab")).forge.unwrap().host;
+        assert_eq!(host("https://git.example.com:8443/team/app.git"), "git.example.com:8443");
+        assert_eq!(host("https://git.example.com:443/team/app.git"), "git.example.com");
+        assert_eq!(host("ssh://git@git.example.com:2222/team/app.git"), "git.example.com");
         let local = parse("file:///srv/git/sandfs", Some("github:o/n"));
         assert_eq!((local.slug.as_str(), local.url.as_str()), ("o/n", "file:///srv/git/sandfs"));
         // github.com in the path or in a longer host name is not GitHub.

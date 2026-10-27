@@ -389,6 +389,8 @@ fn record(store: &Store, repo: &str, name: &str, change: impl FnOnce(&mut crate:
 pub fn delete_branch(project: &Project, copy: &crate::state::Copy) -> Result<String> {
     let Some(landed) = &copy.landed else { return Ok("never landed, so no branch".to_owned()) };
     let branch = &landed.branch;
+    // git talks to the remote from inside the copy, which a restart leaves empty.
+    crate::mount_copy(copy)?;
     let remote = Remote::of(project);
     if let Some(forge) = project.forge.as_ref().map(Forge::new) {
         // A landing cut off before it heard back may have opened one it didn't record.

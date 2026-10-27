@@ -1410,7 +1410,11 @@ fn any_remote_takes_landings_and_gitlab_takes_merge_requests() {
     gft.run(&home, &["new", "gone"]);
     std::fs::write(work.join("plain+gone/gone.txt"), "gone\n").unwrap();
     gft.run(&work.join("plain+gone"), &["land"]);
-    let removed = gft.run(&home, &["rm", "--delete-branch", "gone"]);
+    // Unmounted, as after a restart: the branch still goes, even with --force.
+    let sandfs = sandfs::Home::at(gft.sandfs_home.path()).unwrap();
+    let gone = sandfs.workspaces().unwrap().into_iter().find(|ws| ws.name.ends_with(".gone")).unwrap();
+    sandfs.unmount(&gone.name).unwrap();
+    let removed = gft.run(&home, &["rm", "--force", "--delete-branch", "gone"]);
     assert!(removed.contains("gone: deleted branch graft/gone"), "{removed}");
     assert!(!branches(repo).contains_key("graft/gone"));
 
