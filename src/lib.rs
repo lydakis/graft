@@ -1943,3 +1943,4 @@ mod tests {
         assert!(parse_repo("https://gitlab.com/a/b", Some("a/b/c".into())).is_err());
     }
 }
+// bench

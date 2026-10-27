@@ -176,3 +176,4 @@ pub fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
 pub fn short(commit: &str) -> &str {
     &commit[..commit.len().min(10)]
 }
+// bench

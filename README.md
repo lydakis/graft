@@ -193,3 +193,4 @@ projects/folder/NAME.json  a plain folder's project, named after the folder
 ```
 
 The files themselves are sandfs workspaces, kept by sandfs: `NAME` for the home copy, `NAME._main` for the default branch as last fetched (the start of every new copy), `NAME.COPY` for each copy, and `NAME.COPY.N` for its snapshots. Here `NAME` is the repository's name without the owner, or the folder's name; a folder has no home or `_main` workspace, since each copy clones the folder as it is. A copy's folder sits next to the home copy as `HOME+COPY`. Short-lived files (a request body for `curl`, the pieces of a merge) go in the system's temporary folder and are removed afterwards.
+// bench

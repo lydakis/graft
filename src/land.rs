@@ -643,3 +643,4 @@ mod tests {
         assert!(fingerprint(dir, "linked").unwrap().starts_with("120000 "));
     }
 }
+// bench
