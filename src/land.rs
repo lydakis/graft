@@ -26,6 +26,11 @@ use crate::github::GitHub;
 use crate::state::{Landing, Pr, Store};
 use crate::tools::{self, changes, git, short};
 
+/// The largest text file sent inside a tree rather than as a blob of its own.
+const INLINE: usize = 1 << 20;
+/// Roughly how much text one tree request carries.
+const BATCH: usize = 8 << 20;
+
 pub struct Options<'a> {
     pub message: Option<&'a str>,
     pub body: Option<&'a str>,
@@ -49,16 +54,7 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
     if !options.dry_run && marked != copy.conflicts {
         record(store, repo, name, |copy| copy.conflicts = marked.clone())?;
     }
-    if !marked.is_empty() && !options.allow_conflicts {
-        let paths: Vec<&str> = marked.iter().map(String::as_str).collect();
-        bail!(
-            "{} still {} conflict markers from `gft sync`: {}. Settle them first, or land with \
-             --allow-conflicts to publish them as they are",
-            crate::files(marked.len()),
-            if marked.len() == 1 { "has" } else { "have" },
-            paths.join(", ")
-        );
-    }
+    crate::refuse_conflicts(&marked, options.allow_conflicts)?;
     let github = GitHub::new(repo)?;
     // Built on work merged since: its files still have that work as it was, and sync
     // takes in the merged version.
@@ -226,29 +222,57 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
         }
     };
 
-    let mut entries = Vec::new();
+    // Text goes inside the tree itself, so a landing takes a call or two rather than
+    // one per file; other files, and very large ones, go as blobs of their own. Trees
+    // are made a batch at a time, each on the one before.
+    let mut batches: Vec<Vec<Value>> = vec![Vec::new()];
+    let mut batch_bytes = 0;
     let mut files = BTreeMap::new();
     for change in &changed {
         // Before reading the file: if it changes in between, it counts as not landed.
         files.insert(change.path.clone(), fingerprint(&copy.dir, &change.path)?);
-        entries.push(match change.kind {
+        let mut size = 0;
+        let entry = match change.kind {
             'D' => json!({"path": change.path, "mode": "100644", "type": "blob", "sha": null}),
             _ => {
                 let (mode, data) = read(&copy.dir.join(&change.path))?;
-                let blob = github.call(
-                    "POST",
-                    "git/blobs",
-                    Some(&json!({"content": base64::engine::general_purpose::STANDARD.encode(data),
-                        "encoding": "base64"})),
-                )?;
-                json!({"path": change.path, "mode": mode, "type": "blob", "sha": sha(&blob)?})
+                match String::from_utf8(data) {
+                    Ok(text) if text.len() <= INLINE => {
+                        size = text.len();
+                        json!({"path": change.path, "mode": mode, "type": "blob", "content": text})
+                    }
+                    other => {
+                        let data = other.map_or_else(|err| err.into_bytes(), String::into_bytes);
+                        let blob = github.call(
+                            "POST",
+                            "git/blobs",
+                            Some(&json!({"content": base64::engine::general_purpose::STANDARD.encode(data),
+                                "encoding": "base64"})),
+                        )?;
+                        json!({"path": change.path, "mode": mode, "type": "blob", "sha": sha(&blob)?})
+                    }
+                }
             }
-        });
+        };
+        if batch_bytes + size > BATCH {
+            batches.push(Vec::new());
+            batch_bytes = 0;
+        }
+        batch_bytes += size;
+        batches.last_mut().expect("one batch at least").push(entry);
     }
-    let tree = match entries.is_empty() {
-        true => base_tree,
-        false => sha(&github.call("POST", "git/trees", Some(&json!({"base_tree": base_tree, "tree": entries})))?)?,
+    // How many of the files differ from what the last landing carried.
+    let fresh = match ours {
+        Some(ours) => {
+            files.iter().filter(|(path, now)| ours.files.get(*path) != Some(now)).count()
+                + ours.files.keys().filter(|path| !files.contains_key(*path)).count()
+        }
+        None => files.len(),
     };
+    let mut tree = base_tree;
+    for batch in batches.into_iter().filter(|batch| !batch.is_empty()) {
+        tree = sha(&github.call("POST", "git/trees", Some(&json!({"base_tree": tree, "tree": batch})))?)?;
+    }
     // The branch holds the copy as it is already, as after a landing whose pull
     // request was never made.
     let current = match ours {
@@ -350,7 +374,11 @@ pub fn land(store: &Store, repo: &str, name: &str, options: &Options) -> Result<
     };
     let url = pr.url.clone();
     record(store, repo, name, |copy| copy.pr = Some(pr))?;
-    println!("{branch} at {}, {}: {url}", short(&commit), crate::files(changed.len()));
+    let fresh = match ours {
+        Some(_) if !current && fresh != changed.len() => format!(", {fresh} changed since the last landing"),
+        _ => String::new(),
+    };
+    println!("{branch} at {}, {}{fresh}: {url}", short(&commit), crate::files(changed.len()));
     Ok(())
 }
 
@@ -400,6 +428,34 @@ fn head_of(github: &GitHub, branch: &str) -> Result<Option<String>> {
         .get_opt(&format!("git/ref/heads/{branch}"))?
         .map(|found| found["object"]["sha"].as_str().map(str::to_owned).context("GitHub gave a branch without a sha"))
         .transpose()
+}
+
+/// Delete the branch the copy last landed on, once its pull request is merged or
+/// closed and the branch holds nothing but what the copy landed. Says what happened.
+pub fn delete_branch(repo: &str, copy: &crate::state::Copy) -> Result<String> {
+    let Some(landed) = &copy.landed else { return Ok("never landed, so no branch".to_owned()) };
+    let branch = &landed.branch;
+    let github = GitHub::new(repo)?;
+    // A landing cut off before it heard back may have opened one it didn't record.
+    let open = match &copy.pr {
+        Some(pr) => {
+            (github.call("GET", &format!("pulls/{}", pr.number), None)?["state"] == "open").then_some(pr.number)
+        }
+        None => open_pr(&github, repo, branch)?.map(|pr| pr.number),
+    };
+    if let Some(number) = open {
+        return Ok(format!("kept branch {branch}: pull request #{number} is still open"));
+    }
+    match head_of(&github, branch)? {
+        None => Ok(format!("branch {branch} is gone already")),
+        Some(head) if head != landed.commit => {
+            Ok(format!("kept branch {branch}: it has commits this copy didn't land"))
+        }
+        Some(_) => {
+            github.call("DELETE", &format!("git/refs/heads/{branch}"), None)?;
+            Ok(format!("deleted branch {branch}"))
+        }
+    }
 }
 
 /// The number of the pull request that carried `landing` into the branch `into` (the
