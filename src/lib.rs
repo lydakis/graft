@@ -1,17 +1,18 @@
-//! Graft (`gft`): work in many fast copies of a GitHub repository, or of a plain folder.
+//! Graft (`gft`): work in many fast copies of a git repository, or of a plain folder.
 //!
 //! Every copy is a sandfs folder over a commit of the repository's default branch, so
-//! nothing is cloned and a copy costs what it changes. GitHub stays the place where
-//! history, review and merging live: `gft land` turns a copy's changes into a branch
-//! and a pull request through GitHub's API, without a local commit or a push. A copy
-//! of a plain folder is the folder as it was when copied, and lands by writing its
-//! changes back into the folder.
+//! nothing is cloned and a copy costs what it changes. The remote stays the place where
+//! history, review and merging live: `gft land` turns a copy's changes into a commit
+//! on a branch, pushed with plain git, and on GitHub or GitLab into a pull or merge
+//! request. A copy of a plain folder is the folder as it was when copied, and lands by
+//! writing its changes back into the folder.
 //!
 //! Graft keeps only names and pointers (see `state`); sandfs keeps the files and git
 //! inside each copy keeps working as in any checkout.
 
-mod github;
+mod forge;
 mod land;
+mod remote;
 mod state;
 mod tools;
 
@@ -29,7 +30,7 @@ use crate::tools::{changes, copy_changes, ensure_mounted, fork, git, mount, moun
 #[command(
     name = "gft",
     version,
-    about = "Work in fast copies of a GitHub repository that share its files, built on sandfs"
+    about = "Work in fast copies of a git repository that share its files, built on sandfs"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -45,12 +46,16 @@ enum Cmd {
     /// folder itself is the home copy: copies are the folder as it is when made, and
     /// `land` writes their changes back into it.
     Get {
-        /// OWNER/NAME on GitHub, the repository's URL, or a folder.
+        /// OWNER/NAME on GitHub, the repository's URL (any host git can push to), or a
+        /// folder.
         repo: String,
         dir: Option<PathBuf>,
-        /// Where copies land, as OWNER/NAME, for a URL that isn't github.com's.
-        #[arg(long, value_name = "OWNER/NAME")]
-        github: Option<String>,
+        /// The forge that keeps the remote's review requests, for a host Graft doesn't
+        /// know by name: github or gitlab (a server of your own: its API is at the
+        /// remote's host), optionally with the project, as gitlab:GROUP/NAME. `none`
+        /// lands branches alone. github.com and gitlab.com need nothing.
+        #[arg(long, value_name = "KIND[:PROJECT]")]
+        forge: Option<String>,
     },
     /// Make copies named NAME on the newest commit of the default branch, or on another
     /// copy with its changes so far. Each appears next to the home copy, as HOME+NAME.
@@ -120,52 +125,53 @@ enum Cmd {
     /// A copy of a plain folder moves onto the folder as it is now. Programs working
     /// in the copy carry on.
     Sync { name: Option<String> },
-    /// Land a copy as a pull request: a branch graft/NAME on GitHub with one commit of
-    /// its changes. Landing again adds a commit to the same pull request. A copy of a
-    /// plain folder lands by writing its changes into the folder, unless a file it
-    /// changed was also changed there since.
+    /// Land a copy: push a branch graft/NAME with one commit of its changes, and on
+    /// GitHub or GitLab open a pull or merge request for it. Landing again adds a
+    /// commit to the same branch and request. A copy of a plain folder lands by
+    /// writing its changes into the folder, unless a file it changed was also changed
+    /// there since.
     Land {
         name: Option<String>,
-        /// The pull request's title, and the commit's message.
+        /// The review request's title, and the commit's message.
         #[arg(long, short)]
         message: Option<String>,
-        /// The pull request's description. On a pull request already open, it replaces
-        /// the description there.
+        /// The review request's description. On one already open, it replaces the
+        /// description there.
         #[arg(long, conflicts_with = "body_file")]
         body: Option<String>,
         /// Read the description from a file, or from standard input for `-`.
         #[arg(long, value_name = "PATH")]
         body_file: Option<PathBuf>,
-        /// Open the pull request as a draft.
+        /// Open the review request as a draft.
         #[arg(long)]
         draft: bool,
-        /// Land even though the branch on GitHub has commits this copy didn't land,
-        /// whose changes this landing then undoes.
+        /// Land even though the branch on the remote has commits this copy didn't
+        /// land, whose changes this landing then undoes.
         #[arg(long)]
         force: bool,
-        /// Print what landing would do (the branch, the commit's parents, the pull
-        /// request and the files), changing nothing on GitHub or here.
+        /// Print what landing would do (the branch, the commit's parents, the review
+        /// request and the files), changing nothing on the remote or here.
         #[arg(long, short = 'n')]
         dry_run: bool,
-        /// Open a new pull request, on a branch of its own, leaving the copy's earlier
-        /// one as it is: for one closed without being merged.
+        /// Open a new review request, on a branch of its own, leaving the copy's
+        /// earlier one as it is: for one closed without being merged.
         #[arg(long)]
         new_pr: bool,
         /// Land files that still have conflict markers from `gft sync`.
         #[arg(long)]
         allow_conflicts: bool,
     },
-    /// Delete copies, with their snapshots. Their pull requests stay as they are.
-    /// A copy with changes that never landed (no pull request, or files changed since
-    /// its last landing) is kept unless `--force` is given.
+    /// Delete copies, with their snapshots. Their branches and review requests stay as
+    /// they are. A copy with changes that never landed (never landed, or files changed
+    /// since its last landing) is kept unless `--force` is given.
     Rm {
         #[arg(required = true)]
         names: Vec<String>,
         /// Delete the copies even if their changes never landed.
         #[arg(long, short)]
         force: bool,
-        /// Also delete each copy's branch on GitHub, once its pull request is merged
-        /// or closed; a branch with commits the copy didn't land stays.
+        /// Also delete each copy's branch on the remote, unless its review request is
+        /// still open; a branch with commits the copy didn't land stays.
         #[arg(long)]
         delete_branch: bool,
     },
@@ -231,7 +237,7 @@ pub fn main() {
 fn run(cli: Cli) -> Result<()> {
     let store = Store::locate()?;
     match cli.command {
-        Cmd::Get { repo, dir, github } => get(&store, &repo, dir, github),
+        Cmd::Get { repo, dir, forge } => get(&store, &repo, dir, forge),
         Cmd::New { names, from, on } => match on {
             Some(on) => new(&store, &names, Some((&on, true))),
             None => new(&store, &names, from.as_deref().map(|from| (from, false))),
@@ -359,7 +365,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             for name in &names {
                 if delete_branch && !project.folder {
-                    println!("{name}: {}", land::delete_branch(&project.repo, copy(&project, name)?)?);
+                    println!("{name}: {}", land::delete_branch(&project, copy(&project, name)?)?);
                 }
                 rm(&store, &project.repo, name)?;
             }
@@ -557,8 +563,8 @@ fn owner_name(path: &str) -> Option<String> {
     (valid(owner) && valid(name)).then(|| format!("{owner}/{name}"))
 }
 
-/// The host and path of a URL (`https://host/path`, `ssh://git@host/path`) or of the
-/// `git@host:path` form that git also accepts.
+/// The host and path of a URL (`https://host/path`, `ssh://git@host/path`,
+/// `file:///path`) or of the `git@host:path` form that git also accepts.
 fn host_and_path(repo: &str) -> Option<(&str, &str)> {
     let (authority, path) = match repo.split_once("://") {
         Some((_, rest)) => rest.split_once('/').unwrap_or((rest, "")),
@@ -568,25 +574,61 @@ fn host_and_path(repo: &str) -> Option<(&str, &str)> {
     Some((host, path.split(['?', '#']).next()?))
 }
 
-/// `owner/name` and the URL to mount for what `gft get` was given.
-fn parse_repo(repo: &str, github: Option<String>) -> Result<(String, String)> {
-    let github = github.map(|text| owner_name(&text).context("--github takes OWNER/NAME")).transpose()?;
-    if repo.contains("://") || repo.contains('@') {
-        // The host decides, so a github.com that only appears in the path doesn't count.
-        let (host, path) = host_and_path(repo).with_context(|| format!("can't read {repo} as a repository URL"))?;
-        let on_github = host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("www.github.com");
-        let slug = match github {
-            Some(slug) => slug,
-            None if on_github => {
-                owner_name(path.trim_start_matches('/')).context("can't tell the repository's owner and name")?
-            }
-            None => bail!("{repo} isn't on github.com; say where copies land with --github OWNER/NAME"),
-        };
-        return Ok((slug, repo.to_owned()));
+/// Where a repository lands, as `gft get` was told: its URL, the project's name (the
+/// last two parts of its path, as `owner/name`), and its forge.
+#[derive(Debug)]
+struct Target {
+    slug: String,
+    url: String,
+    forge: Option<forge::Spec>,
+}
+
+/// What `gft get` was given, a URL or OWNER/NAME on GitHub, with `--forge`.
+fn parse_repo(repo: &str, forge: Option<&str>) -> Result<Target> {
+    let (url, host, path) = match repo.contains("://") || repo.contains('@') {
+        true => {
+            let (host, path) = host_and_path(repo).with_context(|| format!("can't read {repo} as a repository URL"))?;
+            (repo.to_owned(), host, path.trim_start_matches('/'))
+        }
+        false => {
+            let slug = owner_name(repo).context("give the repository as OWNER/NAME on GitHub, or its URL")?;
+            return Ok(Target {
+                url: format!("https://github.com/{slug}"),
+                forge: match forge {
+                    Some(text) => spec_from(text, Some("github.com"), Some(&slug))?,
+                    None => forge::Spec::new(forge::Kind::GitHub, "github.com", &slug),
+                },
+                slug,
+            });
+        }
+    };
+    let known = ["github.com", "www.github.com", "gitlab.com"].contains(&host.to_ascii_lowercase().as_str());
+    let forge = match forge {
+        Some(text) => spec_from(text, Some(host), Some(path))?,
+        None if known => {
+            Some(forge::Spec::of_host(host, path).with_context(|| format!("can't tell the repository in {repo}"))?)
+        }
+        None => None,
+    };
+    // Named for its forge's project, or for the last two parts of its path.
+    let named = forge.as_ref().map_or(path, |forge| forge.project.as_str());
+    let named = named.trim_end_matches('/');
+    let parts: Vec<&str> = named.rsplitn(3, '/').collect();
+    let slug = match parts[..] {
+        [name, owner, ..] => owner_name(&format!("{owner}/{name}")),
+        [name] if !host.is_empty() => owner_name(&format!("{host}/{name}")),
+        _ => None,
+    };
+    let slug = slug.with_context(|| format!("can't tell a name for {repo} from its path"))?;
+    Ok(Target { slug, url, forge })
+}
+
+/// A forge as `--forge` names it, or none for `none`.
+fn spec_from(text: &str, host: Option<&str>, path: Option<&str>) -> Result<Option<forge::Spec>> {
+    match text {
+        "none" => Ok(None),
+        text => forge::Spec::parse(text, host, path).map(Some),
     }
-    let slug = owner_name(repo).context("give the repository as OWNER/NAME")?;
-    let url = format!("https://github.com/{slug}");
-    Ok((github.unwrap_or(slug), url))
 }
 
 /// `repo` as a folder on this machine, when it is a path (one starting with `/`, `.` or
@@ -600,23 +642,23 @@ fn as_folder(repo: &str) -> Option<PathBuf> {
     (path_like && path.is_dir()).then_some(path)
 }
 
-fn get(store: &Store, repo: &str, dir: Option<PathBuf>, github: Option<String>) -> Result<()> {
+fn get(store: &Store, repo: &str, dir: Option<PathBuf>, forge: Option<String>) -> Result<()> {
     if let Some(folder) = as_folder(repo) {
         if dir.is_some() {
-            bail!("a folder is its own home copy; DIR is for repositories on GitHub");
+            bail!("a folder is its own home copy; DIR is for repositories");
         }
         if folder.join(".git").exists() {
-            return get_checkout(store, &folder, github);
+            return get_checkout(store, &folder, forge);
         }
-        if github.is_some() {
-            bail!("a plain folder lands into itself; --github is for repositories");
+        if forge.is_some() {
+            bail!("a plain folder lands into itself; --forge is for repositories");
         }
         return get_folder(store, &folder);
     }
     if repo.starts_with(['/', '.', '~']) {
         bail!("{repo} is no folder");
     }
-    let (slug, source) = parse_repo(repo, github)?;
+    let Target { slug, url: source, forge } = parse_repo(repo, forge.as_deref())?;
     let short_name = slug.rsplit('/').next().expect("owner/name").to_owned();
     let dir = std::path::absolute(dir.unwrap_or_else(|| PathBuf::from(&short_name)))?;
     already(store, &slug)?;
@@ -625,6 +667,8 @@ fn get(store: &Store, repo: &str, dir: Option<PathBuf>, github: Option<String>) 
     let dir = dir.canonicalize()?;
     let mut project = Project {
         repo: slug.clone(),
+        remote: source.clone(),
+        forge,
         source,
         home: dir.clone(),
         workspace: name.clone(),
@@ -677,36 +721,30 @@ fn free_workspace(store: &Store, repo: &str) -> Result<String> {
 }
 
 /// Make the git checkout `folder` a project, whose home copy is the checkout itself:
-/// copies start from its commit and its uncommitted changes, and land on GitHub.
-fn get_checkout(store: &Store, folder: &Path, github: Option<String>) -> Result<()> {
+/// copies start from its commit and its uncommitted changes, and land on its origin.
+fn get_checkout(store: &Store, folder: &Path, forge: Option<String>) -> Result<()> {
     let folder = folder.canonicalize()?;
-    let slug = match (github, git(&folder, &["remote", "get-url", "origin"]).ok()) {
-        (Some(github), _) => owner_name(&github).context("--github takes OWNER/NAME")?,
-        (None, Some(url)) => parse_repo(&url, None).map(|(slug, _)| slug).with_context(|| {
-            format!(
-                "{}'s origin, {url}, isn't on GitHub; say where copies land with --github OWNER/NAME",
-                folder.display()
-            )
-        })?,
-        (None, None) => {
-            bail!("{} has no remote named origin; say where copies land with --github OWNER/NAME", folder.display())
-        }
+    let Ok(origin) = git(&folder, &["remote", "get-url", "origin"]) else {
+        bail!("{} has no remote named origin, which copies would land on", folder.display())
     };
+    let Target { slug, url, forge } = parse_repo(&origin, forge.as_deref())?;
     already(store, &slug)?;
     let name = free_workspace(store, &slug)?;
-    // Pull requests go against the default branch: as the checkout last heard of it
-    // from origin, else as GitHub says.
+    // Copies land against the default branch: as the checkout last heard of it from
+    // origin, else as origin says now.
     let known = git(&folder, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
         .ok()
         .and_then(|branch| branch.strip_prefix("origin/").map(str::to_owned));
     let branch = match known {
         Some(branch) => branch,
-        None => github::GitHub::new(&slug)
-            .and_then(|github| github.default_branch())
-            .with_context(|| format!("asking GitHub for {slug}'s default branch, which pull requests go against"))?,
+        None => remote::Remote::new(&url, forge.as_ref())
+            .default_branch(&folder)
+            .with_context(|| format!("asking {url} for its default branch, which copies land against"))?,
     };
     let project = Project {
         repo: slug.clone(),
+        remote: url,
+        forge,
         source: path_str(&folder)?.to_owned(),
         home: folder.clone(),
         workspace: name,
@@ -729,10 +767,7 @@ fn get_checkout(store: &Store, folder: &Path, github: Option<String>) -> Result<
 fn get_folder(store: &Store, folder: &Path) -> Result<()> {
     let folder = folder.canonicalize()?;
     if folder.join(".git").exists() {
-        bail!(
-            "{} is a git repository; `gft get OWNER/NAME` works on its repository on GitHub instead",
-            folder.display()
-        );
+        bail!("{} is a git repository; `gft get` its remote's URL instead", folder.display());
     }
     let name = folder.file_name().context("the folder has no name")?.to_string_lossy().into_owned();
     check_copy_name(&name).with_context(|| format!("{} can't name a project", folder.display()))?;
@@ -741,6 +776,8 @@ fn get_folder(store: &Store, folder: &Path) -> Result<()> {
     }
     let project = Project {
         repo: format!("folder/{name}"),
+        remote: String::new(),
+        forge: None,
         source: path_str(&folder)?.to_owned(),
         home: folder.clone(),
         workspace: name,
@@ -1368,50 +1405,59 @@ fn in_use<T>(dir: &Path, result: Result<T>) -> Result<T> {
     })
 }
 
-/// Work of a copy's that GitHub merged since the copy last synced: its own last
-/// landing, or the landing it was built on. The copy's files started from that
-/// landing, so it, not the copy's base, is what upstream's version is merged from.
+/// Work of a copy's merged into the default branch since the copy last synced: its
+/// own last landing, or the landing it was built on.
 struct Merged {
-    github: github::GitHub,
+    remote: remote::Remote,
     /// The landing's commit.
     commit: String,
     /// What happened, for people.
     said: String,
-    /// The pull request of the copy's own that is over: closed with the branch under
-    /// it, or merged.
+    /// The copy's own landing is over: its review request merged, or closed with the
+    /// branch under it.
     done: bool,
 }
 
-/// What of the copy's GitHub merged since it last synced, if anything.
+/// What of the copy's was merged since it last synced, if anything.
 fn merged(project: &Project, copy: &Copy, name: &str) -> Result<Option<Merged>> {
-    if project.folder || (copy.stacked.is_none() && copy.pr.is_none()) {
+    if project.folder || (copy.stacked.is_none() && copy.landed.is_none()) {
         return Ok(None);
     }
-    let github = github::GitHub::new(&project.repo)?;
-    let pull = match &copy.pr {
-        Some(pr) => Some((pr.number, github.call("GET", &format!("pulls/{}", pr.number), None)?)),
-        None => None,
+    let forge = project.forge.as_ref().map(forge::Forge::new);
+    let remote = remote::Remote::of(project);
+    let review = match (&copy.pr, &forge) {
+        (Some(pr), Some(forge)) => Some(forge.get(pr.number)?),
+        _ => None,
     };
     // Merged into the default branch, that is: one merged into the branch of the
     // copy it was built on is in the default branch only once that one is.
-    if let (Some((number, pull)), Some(landed)) = (&pull, &copy.landed)
-        && pull["merged_at"].is_string()
-        && !landed.commit.is_empty()
-        && (pull["base"]["ref"] == project.branch.as_str()
-            || land::merged_pull(&github, &project.repo, landed, &project.branch)?.is_some())
-    {
-        let said = format!("pull request #{number} was merged; {name} lands next as a new one");
-        return Ok(Some(Merged { commit: landed.commit.clone(), said, done: true, github }));
+    if let Some(landed) = &copy.landed {
+        let merged = match (&review, &forge) {
+            (Some(review), Some(forge)) if review.state == forge::State::Merged => (review.base == project.branch
+                || land::merged_pull(forge, landed, &project.branch)?.is_some())
+            .then(|| format!("{} #{} was merged", forge.noun(), review.number)),
+            (_, Some(_)) => None,
+            (_, None) => land::merged_into(project, &remote, None, &copy.dir, landed)?
+                .map(|how| format!("{} is in {} ({how})", landed.branch, project.branch)),
+        };
+        if let Some(said) = merged {
+            let said = format!("{said}; {name} lands next as a new one");
+            return Ok(Some(Merged { commit: landed.commit.clone(), said, done: true, remote }));
+        }
     }
     let Some(stacked) = &copy.stacked else { return Ok(None) };
-    let Some(number) = land::merged_pull(&github, &project.repo, stacked, &project.branch)? else { return Ok(None) };
-    let mut said = format!("{} was merged (#{number}); {name} now builds on {}", stacked.branch, project.branch);
-    // GitHub closes a pull request whose base branch goes, and it can't be reopened.
-    let closed = pull.as_ref().filter(|(_, pull)| pull["state"] != "open");
-    if let Some((number, _)) = closed {
-        said.push_str(&format!("; its pull request #{number} closed with that branch, so `gft land` opens a new one"));
+    let Some(how) = land::merged_into(project, &remote, forge.as_ref(), &copy.dir, stacked)? else { return Ok(None) };
+    let mut said = format!("{} was merged ({how}); {name} now builds on {}", stacked.branch, project.branch);
+    // A forge closes a review whose base branch goes, and it can't be reopened.
+    let closed = review.as_ref().filter(|review| review.state != forge::State::Open);
+    if let (Some(review), Some(forge)) = (closed, &forge) {
+        let noun = forge.noun();
+        said.push_str(&format!(
+            "; its {noun} #{} closed with that branch, so `gft land` opens a new one",
+            review.number
+        ));
     }
-    Ok(Some(Merged { commit: stacked.commit.clone(), said, done: closed.is_some(), github }))
+    Ok(Some(Merged { commit: stacked.commit.clone(), said, done: closed.is_some(), remote }))
 }
 
 /// Move a copy onto the newest commit of the default branch, or the folder as it is
@@ -1491,7 +1537,7 @@ fn sync_saved(store: &Store, project: &Project, copy: &Copy, name: &str, merged:
                 _ => "changed in the folder too; kept yours".to_owned(),
             },
             (false, Some(merged)) => {
-                let base = land::file_at(&merged.github, &merged.commit, path)?;
+                let base = land::file_at(&merged.remote, &copy.dir, &merged.commit, path)?;
                 merge(&copy.dir, base, &new, path, renamed)?
             }
             (false, None) => {
@@ -1853,6 +1899,8 @@ mod tests {
     fn folder_bases_differ_whatever_the_clock_says() {
         let mut project = Project {
             repo: "folder/notes".into(),
+            remote: String::new(),
+            forge: None,
             source: "/notes".into(),
             home: "/notes".into(),
             workspace: "notes".into(),
@@ -1881,8 +1929,15 @@ mod tests {
 
     #[test]
     fn repositories_are_named_by_owner_and_name() {
-        let parse = |repo: &str| parse_repo(repo, None).unwrap();
-        assert_eq!(parse("lydakis/sandfs"), ("lydakis/sandfs".into(), "https://github.com/lydakis/sandfs".into()));
+        let parse = |repo: &str| {
+            let target = parse_repo(repo, None).unwrap();
+            (target.slug, target.url, target.forge.map(|forge| (forge.kind, forge.project)))
+        };
+        let github = Some((forge::Kind::GitHub, "lydakis/sandfs".to_owned()));
+        assert_eq!(
+            parse("lydakis/sandfs"),
+            ("lydakis/sandfs".into(), "https://github.com/lydakis/sandfs".into(), github.clone())
+        );
         assert_eq!(parse("lydakis/sandfs.git").0, "lydakis/sandfs");
         assert_eq!(parse("lydakis/sandfs/").0, "lydakis/sandfs");
         for url in [
@@ -1897,22 +1952,33 @@ mod tests {
             "ssh://git@github.com/lydakis/sandfs",
             "ssh://git@github.com:22/lydakis/sandfs.git",
         ] {
-            assert_eq!(parse(url), ("lydakis/sandfs".into(), url.into()), "{url}");
+            assert_eq!(parse(url), ("lydakis/sandfs".into(), url.into(), github.clone()), "{url}");
         }
     }
 
     #[test]
-    fn other_hosts_need_to_say_where_copies_land() {
-        let other = "https://gitlab.com/lydakis/sandfs";
-        assert!(parse_repo(other, None).is_err());
-        assert_eq!(parse_repo(other, Some("o/n".into())).unwrap(), ("o/n".into(), other.into()));
-        assert!(parse_repo("file:///srv/sandfs", None).is_err());
-        assert_eq!(parse_repo("file:///srv/sandfs", Some("o/n".into())).unwrap().0, "o/n");
+    fn any_remote_lands_with_git_and_known_forges_add_reviews() {
+        let parse = |repo: &str, forge: Option<&str>| parse_repo(repo, forge).unwrap();
+        // GitLab, nested groups and all, by its host.
+        let gitlab = parse("https://gitlab.com/team/tools/sandfs.git", None);
+        assert_eq!(gitlab.slug, "tools/sandfs");
+        assert_eq!(gitlab.forge.unwrap().project, "team/tools/sandfs");
+        // Another host lands branches alone, unless --forge says what it runs.
+        let other = parse("git@git.example.com:team/sandfs.git", None);
+        assert_eq!((other.slug.as_str(), other.forge.is_none()), ("team/sandfs", true));
+        let own = parse("https://git.example.com/team/sandfs", Some("gitlab")).forge.unwrap();
+        assert_eq!(
+            (own.kind, own.host.as_str(), own.project.as_str()),
+            (forge::Kind::GitLab, "git.example.com", "team/sandfs")
+        );
+        assert!(parse("https://github.com/lydakis/sandfs", Some("none")).forge.is_none());
+        let bare = parse("ssh://host.example.com/sandfs.git", None);
+        assert_eq!(bare.slug, "host.example.com/sandfs");
+        let local = parse("file:///srv/git/sandfs", Some("github:o/n"));
+        assert_eq!((local.slug.as_str(), local.url.as_str()), ("o/n", "file:///srv/git/sandfs"));
         // github.com in the path or in a longer host name is not GitHub.
-        assert!(parse_repo("https://example.com/github.com/lydakis/sandfs", None).is_err());
-        assert!(parse_repo("https://github.com.example.com/lydakis/sandfs", None).is_err());
-        // Plain OWNER/NAME mounts from GitHub and lands wherever --github says.
-        assert_eq!(parse_repo("a/b", Some("o/n".into())).unwrap(), ("o/n".into(), "https://github.com/a/b".into()));
+        assert!(parse("https://example.com/github.com/lydakis/sandfs", None).forge.is_none());
+        assert!(parse("https://github.com.example.com/lydakis/sandfs", None).forge.is_none());
     }
 
     #[test]
@@ -1929,7 +1995,6 @@ mod tests {
             "/b",
             "a b/c",
             "a/.git",
-            "github.com:a/b",
             "https://github.com/sandfs",
             "https://github.com/",
             "https://github.com",
@@ -1939,7 +2004,7 @@ mod tests {
         ] {
             assert!(parse_repo(repo, None).is_err(), "{repo:?} should be refused");
         }
-        assert!(parse_repo("a/b", Some("nope".into())).is_err());
-        assert!(parse_repo("https://gitlab.com/a/b", Some("a/b/c".into())).is_err());
+        assert!(parse_repo("a/b", Some("nope")).is_err());
+        assert!(parse_repo("https://gitlab.com/a/b", Some("github:a/b/c")).is_err());
     }
 }

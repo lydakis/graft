@@ -1,5 +1,6 @@
 //! `gft` end to end: copies of a repository served from a folder, mounted by sandfs,
-//! landing on a small stand-in for GitHub's API.
+//! landing on that repository with git push, and on a small stand-in for GitHub's
+//! API for pull requests.
 //!
 //! Needs a working mount: on Linux FUSE 3, on macOS nothing. Skipped without one,
 //! unless `GRAFT_REQUIRE_MOUNT` is set, as CI does.
@@ -7,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -36,96 +37,131 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
 
+/// The branches of the repository at `repo`, by name, with the commit each is at.
+fn branches(repo: &Path) -> BTreeMap<String, String> {
+    git(repo, &["for-each-ref", "--format=%(refname:strip=2) %(objectname)", "refs/heads"])
+        .lines()
+        .filter_map(|line| line.split_once(' ').map(|(name, commit)| (name.to_owned(), commit.to_owned())))
+        .collect()
+}
+
+/// The commit the branch `branch` of the repository at `repo` is at.
+fn branch(repo: &Path, branch: &str) -> String {
+    branches(repo).remove(branch).unwrap_or_else(|| panic!("no branch {branch}"))
+}
+
+/// The parents of `commit`.
+fn parents(repo: &Path, commit: &str) -> Vec<String> {
+    git(repo, &["rev-list", "--parents", "-n1", commit]).split(' ').skip(1).map(str::to_owned).collect()
+}
+
+/// The files `commit` changed from its first parent.
+fn changed_by(repo: &Path, commit: &str) -> Vec<String> {
+    let listed = git(repo, &["diff-tree", "--no-commit-id", "--name-only", "-r", &format!("{commit}^1"), commit]);
+    listed.lines().map(str::to_owned).collect()
+}
+
+/// The text of `path` in `commit`, if it has that file.
+fn file_at(repo: &Path, commit: &str, path: &str) -> Option<String> {
+    let out = Command::new("git").arg("-C").arg(repo).args(["show", &format!("{commit}:{path}")]).output().unwrap();
+    out.status.success().then(|| String::from_utf8(out.stdout).unwrap())
+}
+
+/// Make a commit on the branch `name` of the repository at `repo` with `path`
+/// holding `text`, as someone else pushing there would.
+fn push_there(repo: &Path, name: &str, path: &str, text: &str) -> String {
+    let at = branches(repo).get(name).cloned().unwrap_or_else(|| git(repo, &["rev-parse", "main"]));
+    let index = repo.join(".git/other-index");
+    let run = |args: &[&str], input: Option<&str>| {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["-c", "user.name=o", "-c", "user.email=o@o"])
+            .args(args)
+            .env("GIT_INDEX_FILE", &index)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input.unwrap_or_default().as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    run(&["read-tree", &at], None);
+    let blob = run(&["hash-object", "-w", "--stdin"], Some(text));
+    run(&["update-index", "--add", "--cacheinfo", &format!("100644,{blob},{path}")], None);
+    let tree = run(&["write-tree"], None);
+    let commit = run(&["commit-tree", &tree, "-p", &at], Some("someone else's\n"));
+    git(repo, &["update-ref", &format!("refs/heads/{name}"), &commit]);
+    let _ = std::fs::remove_file(index);
+    commit
+}
+
+/// Have the next push to the repository at `repo` fail: before the branch moves, or
+/// (`after`) once it has, as when the answer is lost on the way back.
+fn cut_next_push(repo: &Path, after: bool) {
+    let hook = repo.join(".git/hooks/update");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\n\
+         if [ -e cut-after ]; then rm cut-after; git update-ref \"$1\" \"$3\"; exit 1; fi\n\
+         if [ -e cut-before ]; then rm cut-before; exit 1; fi\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(repo.join(".git").join(if after { "cut-after" } else { "cut-before" }), "").unwrap();
+}
+
 /// What the stand-in GitHub was asked to make.
 #[derive(Default)]
 struct Made {
-    blobs: Vec<Vec<u8>>,
-    trees: Vec<Value>,
-    commits: Vec<Value>,
-    refs: BTreeMap<String, String>,
     pulls: Vec<Value>,
     /// The bodies of PATCH pulls/N, as `(N, body)`.
     patches: Vec<(u64, Value)>,
-    /// Fail the next branch update without making it, as if cut short before.
-    fail_ref: bool,
-    /// Make the next branch update but answer with a failure, as if cut short after.
-    lose_ref: bool,
     /// Fail the next pull request without making it.
     fail_pull: bool,
     /// Make the next pull request but answer with a failure.
     lose_pull: bool,
-    /// The repository the stand-in serves, for what GitHub reads from commits.
-    repo: Option<std::path::PathBuf>,
-    /// Trees and blobs made, by id.
-    tree_ids: BTreeMap<String, Value>,
-    blob_ids: BTreeMap<String, Vec<u8>>,
+    /// The repository copies land on, which the pull requests' branches are in.
+    repo: PathBuf,
     /// Pull requests moved to another base, as `(N, base)`.
     retargets: Vec<(u64, String)>,
 }
 
-/// The bytes of `path` in the tree `tree`: one made by landing, else a commit's of
-/// the repository, `tree-of-COMMIT`.
-fn file_in(made: &Made, tree: &str, path: &str) -> Option<Vec<u8>> {
-    if let Some(commit) = tree.strip_prefix("tree-of-") {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(made.repo.as_ref()?)
-            .args(["show", &format!("{commit}:{path}")])
-            .output()
-            .ok()?;
-        return out.status.success().then_some(out.stdout);
-    }
-    let body = made.tree_ids.get(tree)?;
-    match body["tree"].as_array()?.iter().find(|entry| entry["path"] == path) {
-        Some(entry) if entry["content"].is_string() => Some(entry["content"].as_str()?.as_bytes().to_vec()),
-        Some(entry) => made.blob_ids.get(entry["sha"].as_str()?).cloned(),
-        None => file_in(made, body["base_tree"].as_str()?, path),
-    }
-}
-
-/// A pull request as GitHub answers for it.
+/// A pull request as GitHub answers for it. Its last commit is its branch's, until
+/// it is merged or closed.
 fn pull_json(made: &Made, n: usize) -> Value {
     let pull = &made.pulls[n - 1];
+    let head = pull
+        .get("head_sha")
+        .cloned()
+        .unwrap_or_else(|| json!(branches(&made.repo).get(pull["head"].as_str().unwrap())));
     json!({"number": n, "html_url": format!("https://github.com/o/n/pull/{n}"),
         "state": pull.get("state").cloned().unwrap_or(json!("open")),
         "merged_at": pull.get("merged_at").cloned().unwrap_or(Value::Null),
         "merge_commit_sha": pull.get("merge_commit_sha").cloned().unwrap_or(Value::Null),
-        "head": {"ref": pull["head"], "sha": pull.get("head_sha").cloned().unwrap_or(Value::Null)},
+        "head": {"ref": pull["head"], "sha": head},
         "base": {"ref": pull["base"]}})
 }
 
-/// Keep the last commit of the branch `branch` with each pull request from it.
-fn track_heads(made: &mut Made, branch: &str, sha: &str) {
-    for pull in made.pulls.iter_mut().filter(|pull| pull["head"] == branch) {
-        pull["head_sha"] = json!(sha);
-    }
+/// Close pull request `n` as merged by the commit `merge`, keeping its last commit.
+fn merge_pull(made: &mut Made, n: usize, merge: &str) {
+    let head = pull_json(made, n)["head"]["sha"].clone();
+    let pull = &mut made.pulls[n - 1];
+    pull["state"] = json!("closed");
+    pull["merged_at"] = json!("2026-10-26T00:00:00Z");
+    pull["merge_commit_sha"] = json!(merge);
+    pull["head_sha"] = head;
 }
 
-/// Whether `to` has `from` in its history: through the commits landing made, then
-/// the repository's.
-fn is_ancestor(made: &Made, from: &str, to: &str) -> bool {
-    if from == to {
-        return true;
-    }
-    if let Some(commit) = made.commits.iter().find(|commit| commit["sha"] == to) {
-        let parents = commit["parents"].as_array().cloned().unwrap_or_default();
-        return parents.iter().any(|parent| is_ancestor(made, from, parent.as_str().unwrap_or_default()));
-    }
-    Command::new("git")
-        .arg("-C")
-        .arg(made.repo.as_ref().unwrap())
-        .args(["merge-base", "--is-ancestor", from, to])
-        .stderr(Stdio::null())
-        .status()
-        .unwrap()
-        .success()
-}
-
-/// Answers the calls `gft land` makes, keeping what it was sent.
-fn fake_github() -> (String, Arc<Mutex<Made>>) {
+/// Answers the calls `gft land` and `gft sync` make about pull requests, keeping what
+/// they were sent, for the repository at `repo`.
+fn fake_github(repo: &Path) -> (String, Arc<Mutex<Made>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let made = Arc::new(Mutex::new(Made::default()));
+    let made = Arc::new(Mutex::new(Made { repo: repo.to_owned(), ..Made::default() }));
     let state = made.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -151,80 +187,20 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
             let body: Value = if body.is_empty() { Value::Null } else { serde_json::from_slice(&body).unwrap() };
-            let path = path.split_once("/repos/o/n").unwrap().1.trim_start_matches('/').to_owned();
             let mut made = state.lock().unwrap();
+            if let Some((_, path)) = path.split_once("/projects/o%2Fn/") {
+                let (status, answer) = gitlab(&mut made, &method, path, body);
+                drop(made);
+                let answer = answer.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+                continue;
+            }
+            let path = path.split_once("/repos/o/n").unwrap().1.trim_start_matches('/').to_owned();
             let (status, answer) = match (method.as_str(), path.as_str()) {
-                ("GET", p) if p.starts_with("git/commits/") => {
-                    let id = &p["git/commits/".len()..];
-                    let tree = made
-                        .commits
-                        .iter()
-                        .position(|c| c["sha"] == id)
-                        .map_or(format!("tree-of-{id}"), |n| made.commits[n]["tree"].as_str().unwrap().to_owned());
-                    (200, json!({"sha": id, "tree": {"sha": tree}}))
-                }
-                ("GET", "") => (200, json!({"default_branch": "main"})),
-                ("POST", "git/blobs") => {
-                    use base64::Engine;
-                    let data =
-                        base64::engine::general_purpose::STANDARD.decode(body["content"].as_str().unwrap()).unwrap();
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    data.hash(&mut hasher);
-                    let sha = format!("blob-{:x}", hasher.finish());
-                    made.blob_ids.insert(sha.clone(), data.clone());
-                    made.blobs.push(data);
-                    (201, json!({"sha": sha}))
-                }
-                ("POST", "git/trees") => {
-                    // Named by contents, as git names trees.
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    body.to_string().hash(&mut hasher);
-                    let sha = format!("tree-{:x}", hasher.finish());
-                    made.tree_ids.insert(sha.clone(), body.clone());
-                    made.trees.push(body);
-                    (201, json!({"sha": sha}))
-                }
-                ("POST", "git/commits") => {
-                    let sha = format!("commit-{}", made.commits.len() + 1);
-                    let mut commit = body;
-                    commit["sha"] = json!(sha);
-                    made.commits.push(commit);
-                    (201, json!({"sha": sha}))
-                }
-                ("GET", p) if p.starts_with("git/ref/heads/") => match made.refs.get(&p["git/ref/".len()..]) {
-                    Some(sha) => (200, json!({"object": {"sha": sha}})),
-                    None => (404, json!({"message": "Not Found"})),
-                },
-                ("POST", "git/refs") | ("PATCH", _) if std::mem::take(&mut made.fail_ref) => {
-                    (502, json!({"message": "cut short"}))
-                }
-                ("POST", "git/refs") => {
-                    let name = body["ref"].as_str().unwrap().trim_start_matches("refs/").to_owned();
-                    let sha = body["sha"].as_str().unwrap().to_owned();
-                    track_heads(&mut made, name.trim_start_matches("heads/"), &sha);
-                    made.refs.insert(name, sha);
-                    if std::mem::take(&mut made.lose_ref) {
-                        (502, json!({"message": "cut short"}))
-                    } else {
-                        (201, json!({}))
-                    }
-                }
-                ("PATCH", p) if p.starts_with("git/refs/") => {
-                    let sha = body["sha"].as_str().unwrap().to_owned();
-                    track_heads(&mut made, p["git/refs/heads/".len()..].trim_end(), &sha);
-                    made.refs.insert(p["git/refs/".len()..].to_owned(), sha);
-                    if std::mem::take(&mut made.lose_ref) {
-                        (502, json!({"message": "cut short"}))
-                    } else {
-                        (200, json!({}))
-                    }
-                }
-                ("DELETE", p) if p.starts_with("git/refs/") => match made.refs.remove(&p["git/refs/".len()..]) {
-                    Some(_) => (204, Value::Null),
-                    None => (422, json!({"message": "Reference does not exist"})),
-                },
                 ("GET", p) if p.starts_with("pulls?head=o:") => {
                     let mut query = p["pulls?head=o:".len()..].split('&');
                     let branch = query.next().unwrap();
@@ -242,34 +218,29 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
                 }
                 ("GET", p) if p.starts_with("compare/") => {
                     let (from, to) = p["compare/".len()..].split_once("...").unwrap();
-                    let ancestor = is_ancestor(&made, from, to);
-                    let status = match (from == to, ancestor) {
-                        (true, _) => "identical",
-                        (false, true) => "ahead",
-                        (false, false) => "diverged",
+                    let ancestor = Command::new("git")
+                        .arg("-C")
+                        .arg(&made.repo)
+                        .args(["merge-base", "--is-ancestor", from, to])
+                        .stderr(Stdio::null())
+                        .status()
+                        .unwrap();
+                    let status = match (from == to, ancestor.success(), ancestor.code()) {
+                        (true, _, _) => "identical",
+                        (false, true, _) => "ahead",
+                        (false, false, Some(1)) => "diverged",
+                        _ => "unknown",
                     };
-                    (200, json!({"status": status}))
-                }
-                ("GET", p) if p.starts_with("contents/") => {
-                    let (path, commit) = p["contents/".len()..].split_once("?ref=").unwrap();
-                    let tree = made
-                        .commits
-                        .iter()
-                        .find(|c| c["sha"] == commit)
-                        .map_or(format!("tree-of-{commit}"), |c| c["tree"].as_str().unwrap().to_owned());
-                    match file_in(&made, &tree, path) {
-                        Some(data) => {
-                            use base64::Engine;
-                            let content = base64::engine::general_purpose::STANDARD.encode(data);
-                            (200, json!({"type": "file", "content": content, "sha": "unused"}))
-                        }
-                        None => (404, json!({"message": "Not Found"})),
+                    match status {
+                        "unknown" => (404, json!({"message": "Not Found"})),
+                        status => (200, json!({"status": status})),
                     }
                 }
                 ("POST", "pulls") if std::mem::take(&mut made.fail_pull) => (502, json!({"message": "cut short"})),
+                ("POST", "pulls") if !branches(&made.repo).contains_key(body["head"].as_str().unwrap()) => {
+                    (422, json!({"message": "Validation Failed: no such head branch"}))
+                }
                 ("POST", "pulls") => {
-                    let mut body = body;
-                    body["head_sha"] = json!(made.refs.get(&format!("heads/{}", body["head"].as_str().unwrap())));
                     made.pulls.push(body);
                     let n = made.pulls.len();
                     match std::mem::take(&mut made.lose_pull) {
@@ -286,7 +257,7 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
                     if !body["body"].is_null() {
                         made.patches.push((number, body["body"].clone()));
                     }
-                    (200, json!({"number": number}))
+                    (200, pull_json(&made, number as usize))
                 }
                 _ => (404, json!({"message": format!("no {method} {path}")})),
             };
@@ -302,6 +273,65 @@ fn fake_github() -> (String, Arc<Mutex<Made>>) {
     (url, made)
 }
 
+/// A merge request as GitLab answers for it, from a pull request kept as GitHub's.
+fn merge_request_json(made: &Made, n: usize) -> Value {
+    let pull = pull_json(made, n);
+    let state = match (pull["state"].as_str(), pull["merged_at"].is_string()) {
+        (_, true) => "merged",
+        (Some("open"), _) => "opened",
+        _ => "closed",
+    };
+    json!({"iid": n, "web_url": format!("https://gitlab.com/o/n/-/merge_requests/{n}"), "state": state,
+        "source_branch": pull["head"]["ref"], "target_branch": pull["base"]["ref"], "sha": pull["head"]["sha"],
+        "merge_commit_sha": pull["merge_commit_sha"], "title": made.pulls[n - 1]["title"],
+        "description": made.pulls[n - 1]["body"]})
+}
+
+/// Answers GitLab's calls about merge requests, kept with GitHub's pull requests.
+fn gitlab(made: &mut Made, method: &str, path: &str, body: Value) -> (u16, Value) {
+    let query = |name: &str| path.split(['?', '&']).find_map(|part| part.strip_prefix(&format!("{name}=")));
+    match method {
+        "GET" if path.starts_with("merge_requests?") => {
+            let (branch, state) = (query("source_branch").unwrap(), query("state").unwrap());
+            let found: Vec<Value> = (1..=made.pulls.len())
+                .filter(|n| made.pulls[n - 1]["head"] == branch)
+                .map(|n| merge_request_json(made, n))
+                .filter(|request| request["state"] == state)
+                .collect();
+            (200, json!(found))
+        }
+        "GET" if path.starts_with("merge_requests/") => {
+            (200, merge_request_json(made, path["merge_requests/".len()..].parse().unwrap()))
+        }
+        "POST" if path == "merge_requests" => {
+            made.pulls.push(json!({"head": body["source_branch"], "base": body["target_branch"],
+                "title": body["title"], "body": body["description"]}));
+            let n = made.pulls.len();
+            (201, merge_request_json(made, n))
+        }
+        "PUT" if path.starts_with("merge_requests/") => {
+            let n: usize = path["merge_requests/".len()..].parse().unwrap();
+            if let Some(base) = body["target_branch"].as_str() {
+                made.pulls[n - 1]["base"] = json!(base);
+                made.retargets.push((n as u64, base.to_owned()));
+            }
+            if !body["description"].is_null() {
+                made.patches.push((n as u64, body["description"].clone()));
+            }
+            (200, merge_request_json(made, n))
+        }
+        "GET" if path.starts_with("repository/merge_base?") => {
+            let refs: Vec<&str> = path.split(['?', '&']).filter_map(|part| part.strip_prefix("refs[]=")).collect();
+            let out = Command::new("git").arg("-C").arg(&made.repo).arg("merge-base").args(&refs).output().unwrap();
+            match out.status.success() {
+                true => (200, json!({"id": String::from_utf8_lossy(&out.stdout).trim()})),
+                false => (404, json!({"message": "404 Not Found"})),
+            }
+        }
+        _ => (404, json!({"message": format!("no {method} {path}")})),
+    }
+}
+
 struct Gft {
     sandfs_home: tempfile::TempDir,
     graft_home: tempfile::TempDir,
@@ -315,7 +345,9 @@ impl Gft {
             .env("SANDFS_HOME", self.sandfs_home.path())
             .env("GRAFT_HOME", self.graft_home.path())
             .env("GRAFT_GITHUB_API", &self.api)
+            .env("GRAFT_GITLAB_API", &self.api)
             .env("GITHUB_TOKEN", "test-token")
+            .env("GITLAB_TOKEN", "test-token")
             .args(args)
             .output()
             .unwrap()
@@ -328,7 +360,9 @@ impl Gft {
             .env("SANDFS_HOME", self.sandfs_home.path())
             .env("GRAFT_HOME", self.graft_home.path())
             .env("GRAFT_GITHUB_API", &self.api)
+            .env("GRAFT_GITLAB_API", &self.api)
             .env("GITHUB_TOKEN", "test-token")
+            .env("GITLAB_TOKEN", "test-token")
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -381,12 +415,12 @@ fn copies_are_made_compared_synced_and_landed() {
     git(repo, &["commit", "-q", "-m", "first"]);
     let first = git(repo, &["rev-parse", "HEAD"]);
 
-    let (api, made) = fake_github();
+    let (api, made) = fake_github(repo);
     let gft = Gft { sandfs_home: tempfile::tempdir().unwrap(), graft_home: tempfile::tempdir().unwrap(), api };
     let work = tempfile::tempdir().unwrap();
     let work = work.path().canonicalize().unwrap();
     let url = format!("file://{}", repo.display());
-    let got = gft.run(&work, &["get", &url, "app", "--github", "o/n"]);
+    let got = gft.run(&work, &["get", &url, "app", "--forge", "github:o/n"]);
     assert!(got.contains("o/n at") && got.contains("(main)"), "{got}");
     let home = work.join("app");
     assert_eq!(std::fs::read_to_string(home.join("README.md")).unwrap(), "hello\n");
@@ -468,16 +502,22 @@ fn copies_are_made_compared_synced_and_landed() {
 
     // Landing makes a branch, one commit on the newest base, and a pull request.
     let landed = gft.run(&fix, &["land", "-m", "Make two return 2", "--body", "Two now returns 2.\n"]);
-    assert!(landed.contains("graft/fix at commit-1, 2 files: https://github.com/o/n/pull/1"), "{landed}");
+    let one = branch(repo, "graft/fix");
+    assert!(
+        landed.contains(&format!("graft/fix at {}, 2 files: https://github.com/o/n/pull/1", &one[..10])),
+        "{landed}"
+    );
     assert!(gft.run(&fix, &["status"]).contains("pull request  https://github.com/o/n/pull/1\n"));
     {
         let made = made.lock().unwrap();
-        assert_eq!(made.trees[0]["base_tree"], format!("tree-of-{second}"));
-        let paths: Vec<&str> =
-            made.trees[0]["tree"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
-        assert_eq!(paths, ["notes.txt", "src/lib.rs"]);
-        assert_eq!(made.commits[0]["parents"], json!([second]));
-        assert_eq!(made.refs["heads/graft/fix"], "commit-1");
+        assert_eq!(changed_by(repo, &one), ["notes.txt", "src/lib.rs"]);
+        assert_eq!(file_at(repo, &one, "src/lib.rs").unwrap(), "// lib\nfn one() {}\n\nfn two() { 2 }\n");
+        assert_eq!(file_at(repo, &one, "CHANGES.md").unwrap(), "- one\n");
+        assert_eq!(parents(repo, &one), std::slice::from_ref(&second));
+        assert_eq!(git(repo, &["log", "-1", "--format=%s", &one]), "Make two return 2");
+        // Git in the copy is left as it was: no commit, nothing staged.
+        assert_eq!(git(&fix, &["rev-parse", "HEAD"]), second);
+        assert!(git(&fix, &["diff", "--cached", "--name-only"]).is_empty());
         assert_eq!(made.pulls[0]["base"], "main");
         assert_eq!(made.pulls[0]["title"], "Make two return 2");
         assert_eq!(made.pulls[0]["body"], "Two now returns 2.\n\nLanded with `gft land` from the copy `fix`.");
@@ -489,9 +529,9 @@ fn copies_are_made_compared_synced_and_landed() {
     {
         let made = made.lock().unwrap();
         assert_eq!(made.pulls.len(), 1);
-        assert_eq!(made.commits[1]["parents"], json!(["commit-1"]));
-        assert_eq!(made.commits[1]["message"], "Update fix");
-        assert_eq!(made.refs["heads/graft/fix"], "commit-2");
+        let two = branch(repo, "graft/fix");
+        assert_eq!(parents(repo, &two), std::slice::from_ref(&one));
+        assert_eq!(git(repo, &["log", "-1", "--format=%s", &two]), "Update fix");
         // No body given: the description on GitHub is left alone.
         assert!(made.patches.is_empty());
     }
@@ -514,12 +554,13 @@ fn copies_are_made_compared_synced_and_landed() {
     let unchanged = gft.try_run(&fix, &["land"]);
     assert!(String::from_utf8_lossy(&unchanged.stderr).contains("nothing new to land"));
     // With nothing new but a description, only the description changes.
+    let before = branch(repo, "graft/fix");
     let redescribed = gft.run(&fix, &["land", "--body", "Only words."]);
     assert!(redescribed.contains("described it anew"), "{redescribed}");
     {
         let made = made.lock().unwrap();
         assert_eq!(made.patches[2], (1, json!("Only words.\n\nLanded with `gft land` from the copy `fix`.")));
-        assert_eq!(made.refs["heads/graft/fix"], "commit-4", "no new commit");
+        assert_eq!(branch(repo, "graft/fix"), before, "no new commit");
     }
 
     // A copy of a copy starts with its changes and lands on top of its branch.
@@ -562,7 +603,7 @@ fn copies_of_a_plain_folder_land_back_into_it() {
     if !mounts() {
         return;
     }
-    let (api, _) = fake_github();
+    let (api, _) = fake_github(Path::new("/nowhere"));
     let gft = Gft { sandfs_home: tempfile::tempdir().unwrap(), graft_home: tempfile::tempdir().unwrap(), api };
     let work = tempfile::tempdir().unwrap();
     let work = work.path().canonicalize().unwrap();
@@ -675,11 +716,11 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "-q", "-m", "first"]);
     let first = git(repo, &["rev-parse", "HEAD"]);
-    let (api, made) = fake_github();
+    let (api, made) = fake_github(repo);
     let gft = Gft { sandfs_home: tempfile::tempdir().unwrap(), graft_home: tempfile::tempdir().unwrap(), api };
     let work = tempfile::tempdir().unwrap();
     let work = work.path().canonicalize().unwrap();
-    gft.run(&work, &["get", &format!("file://{}", repo.display()), "app", "--github", "o/n"]);
+    gft.run(&work, &["get", &format!("file://{}", repo.display()), "app", "--forge", "github:o/n"]);
     let home = work.join("app");
     gft.run(&home, &["new", "fix", "two", "three", "four", "taken"]);
     let at = |name: &str| work.join(format!("app+{name}"));
@@ -702,31 +743,30 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
             &first[..10]
         )
     );
-    assert!(made.lock().unwrap().commits.is_empty() && made.lock().unwrap().refs.is_empty());
+    assert_eq!(branches(repo).len(), 1, "only main");
 
-    // The branch moves but GitHub's answer is lost: landing again sees its own commit
+    // The branch moves but the answer is lost: landing again sees its own commit
     // there and goes on to the pull request, without a second commit.
-    made.lock().unwrap().lose_ref = true;
+    cut_next_push(repo, true);
     fails("fix", &["land", "-m", "Fix"]);
-    assert_eq!(made.lock().unwrap().refs["heads/graft/fix"], "commit-1");
+    let one = branch(repo, "graft/fix");
     let landed = gft.run(&at("fix"), &["land", "-m", "Fix"]);
-    assert!(landed.contains("graft/fix at commit-1, 1 file: https://github.com/o/n/pull/1"), "{landed}");
+    assert!(
+        landed.contains(&format!("graft/fix at {}, 1 file: https://github.com/o/n/pull/1", &one[..10])),
+        "{landed}"
+    );
     {
         let made = made.lock().unwrap();
-        assert_eq!(made.commits.len(), 1);
+        assert_eq!(branch(repo, "graft/fix"), one);
         assert_eq!(made.pulls.len(), 1);
         assert_eq!(made.pulls[0]["title"], "Fix");
     }
     // The commit is made but the branch never moves to it: landing again starts afresh.
-    made.lock().unwrap().fail_ref = true;
+    cut_next_push(repo, false);
     fails("two", &["land"]);
-    assert!(!made.lock().unwrap().refs.contains_key("heads/graft/two"));
+    assert!(!branches(repo).contains_key("graft/two"));
     gft.run(&at("two"), &["land"]);
-    {
-        let made = made.lock().unwrap();
-        assert_eq!(made.refs["heads/graft/two"], "commit-3");
-        assert_eq!(made.commits[2]["parents"], json!([first]));
-    }
+    assert_eq!(parents(repo, &branch(repo, "graft/two")), std::slice::from_ref(&first));
     // GitHub makes the pull request but its answer is lost, or refuses to make it:
     // landing again finds the one made, or makes it, and never makes two.
     made.lock().unwrap().lose_pull = true;
@@ -740,28 +780,23 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
         let made = made.lock().unwrap();
         let heads: Vec<&Value> = made.pulls.iter().map(|pull| &pull["head"]).collect();
         assert_eq!(heads, [&json!("graft/fix"), &json!("graft/two"), &json!("graft/three"), &json!("graft/four")]);
-        // One each, and two's first, which never reached its branch.
-        assert_eq!(made.commits.len(), 5);
+        // One commit each.
+        for name in ["three", "four"] {
+            assert_eq!(parents(repo, &branch(repo, &format!("graft/{name}"))), std::slice::from_ref(&first));
+        }
     }
     // A branch of that name that this copy never landed is someone else's, even with
     // the same files, or an earlier copy's of the same name: a first landing takes a
     // name of its own and none of that branch's history.
-    made.lock().unwrap().refs.insert("heads/graft/taken".into(), "commit-1".into());
+    let theirs = push_there(repo, "graft/taken", "notes.txt", "taken\n");
     let landed = gft.run(&at("taken"), &["land"]);
     assert!(landed.contains("graft/taken-2 at "), "{landed}");
-    {
-        let made = made.lock().unwrap();
-        assert_eq!(made.refs["heads/graft/taken"], "commit-1");
-        assert_eq!(made.commits.last().unwrap()["parents"], json!([first]));
-    }
+    assert_eq!(branch(repo, "graft/taken"), theirs);
+    assert_eq!(parents(repo, &branch(repo, "graft/taken-2")), std::slice::from_ref(&first));
     gft.run(&home, &["rm", "taken"]);
 
-    // Someone adds a commit to fix's branch on GitHub: landing over it would undo it.
-    {
-        let mut made = made.lock().unwrap();
-        made.commits.push(json!({"sha": "pushed", "tree": "tree-pushed"}));
-        made.refs.insert("heads/graft/fix".into(), "pushed".into());
-    }
+    // Someone adds a commit to fix's branch: landing over it would undo it.
+    let pushed = push_there(repo, "graft/fix", "theirs.txt", "theirs\n");
     std::fs::write(at("fix").join("notes.txt"), "fix, and more\n").unwrap();
     let said = fails("fix", &["land"]);
     assert!(said.contains("graft/fix on GitHub has moved since fix last landed"), "{said}");
@@ -769,23 +804,22 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
     std::fs::remove_file(at("fix").join("notes.txt")).unwrap();
     let said = fails("fix", &["land"]);
     assert!(said.contains("has moved since"), "{said}");
-    let plan_tree = made.lock().unwrap().commits.len();
     gft.run(&at("fix"), &["land", "--force"]);
-    {
-        let mut made = made.lock().unwrap();
-        assert_eq!(made.commits.len(), plan_tree + 1);
-        assert_eq!(made.commits.last().unwrap()["tree"], format!("tree-of-{first}"));
-        // And someone adds to the branch again.
-        made.commits.push(json!({"sha": "pushed", "tree": "tree-pushed"}));
-        made.refs.insert("heads/graft/fix".into(), "pushed".into());
-    }
+    let forced = branch(repo, "graft/fix");
+    assert_eq!(parents(repo, &forced), [pushed]);
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("{forced}^{{tree}}")]),
+        git(repo, &["rev-parse", &format!("{first}^{{tree}}")])
+    );
+    // And someone adds to the branch again.
+    let pushed = push_there(repo, "graft/fix", "theirs.txt", "theirs, again\n");
     std::fs::write(at("fix").join("notes.txt"), "fix, and more\n").unwrap();
     let plan = gft.run(&at("fix"), &["land", "--force", "--dry-run"]);
-    assert!(plan.contains("(moved from pushed, replacing commits fix didn't land)"), "{plan}");
-    assert_eq!(made.lock().unwrap().refs["heads/graft/fix"], "pushed");
+    assert!(plan.contains(&format!("(moved from {}, replacing commits fix didn't land)", &pushed[..10])), "{plan}");
+    assert_eq!(branch(repo, "graft/fix"), pushed);
     gft.run(&at("fix"), &["land", "--force"]);
-    let forced = made.lock().unwrap().refs["heads/graft/fix"].clone();
-    assert_eq!(made.lock().unwrap().commits.last().unwrap()["parents"], json!(["pushed"]));
+    let forced = branch(repo, "graft/fix");
+    assert_eq!(parents(repo, &forced), [pushed]);
 
     // Only a copy that landed can be built on.
     gft.run(&home, &["new", "unlanded"]);
@@ -803,15 +837,17 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
     gft.run(&home, &["rm", "--force", "alt"]);
     std::fs::write(at("fix").join("notes.txt"), "fix, more, and later\n").unwrap();
     gft.run(&at("fix"), &["land"]);
-    assert_ne!(made.lock().unwrap().refs["heads/graft/fix"], forced);
+    assert_ne!(branch(repo, "graft/fix"), forced);
     std::fs::write(at("child").join("child.txt"), "on top\n").unwrap();
     let plan = gft.run(&at("child"), &["land", "-n"]);
-    assert!(plan.contains(&format!("commit        on {}\n", &forced[..10.min(forced.len())])), "{plan}");
+    assert!(plan.contains(&format!("commit        on {}\n", &forced[..10])), "{plan}");
     assert!(plan.contains("against graft/fix\n"), "{plan}");
     gft.run(&at("child"), &["land"]);
     {
         let made = made.lock().unwrap();
-        assert_eq!(made.commits.last().unwrap()["parents"], json!([forced]));
+        let child = branch(repo, "graft/child");
+        assert_eq!(parents(repo, &child), std::slice::from_ref(&forced));
+        assert_eq!(file_at(repo, &child, "notes.txt").unwrap(), "fix, and more\n");
         let pull = made.pulls.last().unwrap();
         assert_eq!((&pull["head"], &pull["base"]), (&json!("graft/child"), &json!("graft/fix")));
     }
@@ -821,9 +857,9 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
     let second = git(repo, &["rev-parse", "HEAD"]);
     gft.run(&at("child"), &["sync"]);
     std::fs::write(at("child").join("child.txt"), "on top, synced\n").unwrap();
-    let before = made.lock().unwrap().refs["heads/graft/child"].clone();
+    let before = branch(repo, "graft/child");
     gft.run(&at("child"), &["land"]);
-    assert_eq!(made.lock().unwrap().commits.last().unwrap()["parents"], json!([before, second]));
+    assert_eq!(parents(repo, &branch(repo, "graft/child")), [before, second]);
 
     // fix put back as its base has it: still a change, which `rm` keeps until landed.
     std::fs::remove_file(at("fix").join("notes.txt")).unwrap();
@@ -832,7 +868,11 @@ fn landings_cut_short_are_finished_and_never_undo_others_work() {
     assert!(said.contains("fix has 1 file that never landed"), "{said}");
     let landed = gft.run(&at("fix"), &["land"]);
     assert!(landed.contains("0 files"), "{landed}");
-    assert_eq!(made.lock().unwrap().commits.last().unwrap()["tree"], format!("tree-of-{first}"));
+    let fix = branch(repo, "graft/fix");
+    assert_eq!(
+        git(repo, &["rev-parse", &format!("{fix}^{{tree}}")]),
+        git(repo, &["rev-parse", &format!("{first}^{{tree}}")])
+    );
     gft.run(&home, &["rm", "fix"]);
 
     // Merged upstream, then changed there again: synced, nothing is lost by `rm`.
@@ -861,7 +901,7 @@ fn copies_of_a_checkout_start_from_its_work() {
     std::fs::write(repo.join("README.md"), "hello\n").unwrap();
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "-q", "-m", "first"]);
-    let (api, made) = fake_github();
+    let (api, made) = fake_github(repo);
     let gft = Gft { sandfs_home: tempfile::tempdir().unwrap(), graft_home: tempfile::tempdir().unwrap(), api };
     let work = tempfile::tempdir().unwrap();
     let work = work.path().canonicalize().unwrap();
@@ -872,13 +912,10 @@ fn copies_of_a_checkout_start_from_its_work() {
     let head = git(&app, &["rev-parse", "HEAD"]);
 
     // On a branch of its own, with no word from origin on its default branch:
-    // GitHub says which it is.
+    // origin says which it is.
     git(&app, &["remote", "set-head", "origin", "--delete"]);
     git(&app, &["checkout", "-q", "-b", "feature"]);
-    // Its origin isn't on GitHub, so it needs saying where copies land.
-    let refused = gft.try_run(&work, &["get", "./app"]);
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("isn't on GitHub"));
-    gft.run(&work, &["get", "./app", "--github", "o/n"]);
+    gft.run(&work, &["get", "./app", "--forge", "github:o/n"]);
     assert!(gft.run(&app, &["ls"]).contains("(checkout, main)"));
 
     // A copy has the checkout's uncommitted work; the checkout keeps it too.
@@ -889,7 +926,10 @@ fn copies_of_a_checkout_start_from_its_work() {
     assert_eq!(std::fs::read_to_string(app.join("README.md")).unwrap(), "hello, edited\n");
     std::fs::write(copy.join("more.txt"), "more\n").unwrap();
     gft.run(&copy, &["land"]);
-    assert_eq!(made.lock().unwrap().commits[0]["parents"], json!([head]));
+    let landed = branch(repo, "graft/try");
+    assert_eq!(parents(repo, &landed), [head]);
+    assert_eq!(file_at(repo, &landed, "more.txt").unwrap(), "more\n");
+    assert_eq!(made.lock().unwrap().pulls.len(), 1);
 
     // Committed in the checkout, the edit is the base's once the copy syncs.
     git(&app, &["commit", "-q", "-am", "edit"]);
@@ -907,11 +947,10 @@ fn project() -> (tempfile::TempDir, tempfile::TempDir, Gft, Arc<Mutex<Made>>) {
     std::fs::write(repo.join("README.md"), "one\ntwo\nthree\n").unwrap();
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "-q", "-m", "first"]);
-    let (api, made) = fake_github();
-    made.lock().unwrap().repo = Some(repo.to_path_buf());
+    let (api, made) = fake_github(repo);
     let gft = Gft { sandfs_home: tempfile::tempdir().unwrap(), graft_home: tempfile::tempdir().unwrap(), api };
     let work = tempfile::tempdir().unwrap();
-    gft.run(work.path(), &["get", &format!("file://{}", repo.display()), "app", "--github", "o/n"]);
+    gft.run(work.path(), &["get", &format!("file://{}", repo.display()), "app", "--forge", "github:o/n"]);
     (upstream, work, gft, made)
 }
 
@@ -948,7 +987,7 @@ fn conflicts_hold_landing_until_settled() {
     // Landing refuses them, unless told to publish them as they are.
     let refused = gft.try_run(&copy, &["land"]);
     assert!(String::from_utf8_lossy(&refused.stderr).contains("1 file still has conflict markers"));
-    assert!(made.lock().unwrap().commits.is_empty());
+    assert!(!branches(upstream.path()).contains_key("graft/fix"));
     let plan = gft.run(&copy, &["land", "-n", "--allow-conflicts"]);
     assert!(plan.contains("M README.md"), "{plan}");
     // Settled, it lands.
@@ -956,7 +995,9 @@ fn conflicts_hold_landing_until_settled() {
     std::fs::write(copy.join("README.md"), "one\nTWO upstream\nthree\n").unwrap();
     assert!(!gft.run(&copy, &["status"]).contains("conflicts"));
     gft.run(&copy, &["land"]);
-    assert_eq!(made.lock().unwrap().commits.len(), 1);
+    assert_eq!(made.lock().unwrap().pulls.len(), 1);
+    let landed = branch(upstream.path(), "graft/fix");
+    assert_eq!(file_at(upstream.path(), &landed, "README.md").unwrap(), "one\nTWO upstream\nthree\n");
     gft.run(&copy, &["sync"]);
     // Undone back to before they were settled, the markers count again.
     gft.run(&copy, &["undo"]);
@@ -986,18 +1027,13 @@ fn closed_and_merged_pull_requests_take_no_more_commits() {
     std::fs::write(at("closed").join("closed.txt"), "second\n").unwrap();
     let refused = gft.try_run(&at("closed"), &["land"]);
     assert!(String::from_utf8_lossy(&refused.stderr).contains("#1 was closed without being merged"));
-    assert_eq!(made.lock().unwrap().refs["heads/graft/closed"], "commit-1");
+    assert_eq!(parents(repo, &branch(repo, "graft/closed")).len(), 1, "no second commit");
     let landed = gft.run(&at("closed"), &["land", "--new-pr", "--force"]);
     assert!(landed.contains("graft/closed-2 at ") && landed.contains("pull/3"), "{landed}");
 
     // Merged: what lands next needs to go on top of it, after a sync.
     let merge = commit_upstream(repo, "merged.txt", "first\n");
-    {
-        let mut made = made.lock().unwrap();
-        made.pulls[1]["state"] = json!("closed");
-        made.pulls[1]["merged_at"] = json!("2026-10-26T00:00:00Z");
-        made.pulls[1]["merge_commit_sha"] = json!(merge);
-    }
+    merge_pull(&mut made.lock().unwrap(), 2, &merge);
     std::fs::write(at("merged").join("merged.txt"), "first\nand more\n").unwrap();
     let refused = gft.try_run(&at("merged"), &["land"]);
     assert!(String::from_utf8_lossy(&refused.stderr).contains("#2 was merged; `gft sync merged` first"));
@@ -1008,7 +1044,7 @@ fn closed_and_merged_pull_requests_take_no_more_commits() {
     assert_eq!(gft.run(&at("merged"), &["changes"]), "M merged.txt\n");
     let landed = gft.run(&at("merged"), &["land"]);
     assert!(landed.contains("graft/merged-2 at ") && landed.contains("pull/4"), "{landed}");
-    assert_eq!(made.lock().unwrap().commits.last().unwrap()["parents"], json!([merge]));
+    assert_eq!(parents(repo, &branch(repo, "graft/merged-2")), [merge]);
 
     // `rm --delete-branch` deletes a branch whose pull request is done with, and
     // keeps one still open.
@@ -1023,9 +1059,9 @@ fn closed_and_merged_pull_requests_take_no_more_commits() {
     assert!(!gft.try_run(&at("lost"), &["land"]).status.success());
     let removed = gft.run(&home, &["rm", "--delete-branch", "lost"]);
     assert!(removed.contains("lost: kept branch graft/lost: pull request #5 is still open"), "{removed}");
-    let made = made.lock().unwrap();
-    assert!(!made.refs.contains_key("heads/graft/closed-2"));
-    assert!(made.refs.contains_key("heads/graft/merged-2"));
+    let left = branches(repo);
+    assert!(!left.contains_key("graft/closed-2"));
+    assert!(left.contains_key("graft/merged-2") && left.contains_key("graft/lost"));
 }
 
 #[test]
@@ -1052,10 +1088,10 @@ fn copies_built_on_merged_work_move_onto_main_with_it() {
     let squash = commit_upstream(repo, "lib.txt", "a\nb\n");
     {
         let mut made = made.lock().unwrap();
-        made.pulls[0]["state"] = json!("closed");
-        made.pulls[0]["merged_at"] = json!("2026-10-26T00:00:00Z");
-        made.pulls[0]["merge_commit_sha"] = json!(squash);
-        made.refs.remove("heads/graft/parent");
+        merge_pull(&mut made, 1, &squash);
+        git(repo, &["branch", "-D", "graft/parent"]);
+        let head = pull_json(&made, 2)["head"]["sha"].clone();
+        made.pulls[1]["head_sha"] = head;
         made.pulls[1]["state"] = json!("closed");
     }
     // Landing first is sent to sync; sync merges from the parent's landing, so only
@@ -1072,7 +1108,7 @@ fn copies_built_on_merged_work_move_onto_main_with_it() {
     {
         let made = made.lock().unwrap();
         assert_eq!(made.pulls[2]["base"], "main");
-        assert_eq!(made.commits.last().unwrap()["parents"], json!([squash]));
+        assert_eq!(parents(repo, &branch(repo, "graft/child-2")), [squash]);
     }
 
     // A pull request still open when the work under it merges goes against main
@@ -1084,12 +1120,7 @@ fn copies_built_on_merged_work_move_onto_main_with_it() {
     std::fs::write(work.join("app+top/top.txt"), "y\n").unwrap();
     gft.run(&work.join("app+top"), &["land"]);
     let merged = commit_upstream(repo, "two.txt", "x\n");
-    {
-        let mut made = made.lock().unwrap();
-        made.pulls[3]["state"] = json!("closed");
-        made.pulls[3]["merged_at"] = json!("2026-10-26T00:00:00Z");
-        made.pulls[3]["merge_commit_sha"] = json!(merged);
-    }
+    merge_pull(&mut made.lock().unwrap(), 4, &merged);
     gft.run(&work.join("app+top"), &["sync"]);
     std::fs::write(work.join("app+top/top.txt"), "y\nz\n").unwrap();
     gft.run(&work.join("app+top"), &["land"]);
@@ -1110,6 +1141,8 @@ fn copies_built_on_merged_work_move_onto_main_with_it() {
     {
         let mut made = made.lock().unwrap();
         assert_eq!(made.pulls[6]["base"], "graft/base3");
+        let head = pull_json(&made, 7)["head"]["sha"].clone();
+        made.pulls[6]["head_sha"] = head;
         made.pulls[6]["state"] = json!("closed");
         made.pulls[6]["merged_at"] = json!("2026-10-26T00:00:00Z");
     }
@@ -1126,11 +1159,9 @@ fn copies_built_on_merged_work_move_onto_main_with_it() {
     let merged = commit_upstream(repo, "mid.txt", "y\n");
     {
         let mut made = made.lock().unwrap();
-        let head = made.refs["heads/graft/base3"].clone();
+        let head = branch(repo, "graft/base3");
         made.pulls[6]["merge_commit_sha"] = json!(head);
-        made.pulls[5]["state"] = json!("closed");
-        made.pulls[5]["merged_at"] = json!("2026-10-26T00:00:00Z");
-        made.pulls[5]["merge_commit_sha"] = json!(merged);
+        merge_pull(&mut made, 6, &merged);
     }
     let synced = gft.run(&work.join("app+leaf"), &["sync"]);
     assert!(synced.contains("graft/mid was merged (#7); leaf now builds on main"), "{synced}");
@@ -1213,11 +1244,11 @@ fn many_new_copies_at_once_and_dropping_the_project() {
     assert!(String::from_utf8_lossy(&gft.try_run(&work, &["ls"]).stderr).contains("start with `gft get"));
     // And it can start over.
     let url = format!("file://{}", upstream.path().display());
-    gft.run(&work, &["get", &url, "app", "--github", "o/n"]);
-    let again = gft.try_run(&work, &["get", &url, "again", "--github", "o/n"]);
+    gft.run(&work, &["get", &url, "app", "--forge", "github:o/n"]);
+    let again = gft.try_run(&work, &["get", &url, "again", "--forge", "github:o/n"]);
     assert!(String::from_utf8_lossy(&again.stderr).contains("o/n is a project already, at"));
     // Another owner's repository of the same name sits beside it.
-    gft.run(&work, &["get", &url, "fork", "--github", "p/n"]);
+    gft.run(&work, &["get", &url, "fork", "--forge", "github:p/n"]);
     gft.run(&work.join("fork"), &["new", "x"]);
     assert!(work.join("fork+x/README.md").exists());
     gft.run(&work, &["drop", "fork"]);
@@ -1274,12 +1305,15 @@ fn copies_come_back_and_follow_upstream() {
     let between = gft.run(&home, &["diff", "b", "a"]);
     assert!(between.contains("+noted") && between.contains("app+a/GUIDE.md"), "{between}");
 
-    // Text lands inside the tree, with no call per file.
+    // What lands is the files, not the commit made in the copy, which stays as it was.
+    let local = git(&at("a"), &["rev-parse", "HEAD"]);
     gft.run(&at("a"), &["land"]);
     {
-        let made = made.lock().unwrap();
-        assert!(made.blobs.is_empty());
-        assert_eq!(made.trees[0]["tree"][1]["content"], "noted\n");
+        let landed = branch(repo, "graft/a");
+        assert_eq!(file_at(repo, &landed, "notes.txt").unwrap(), "noted\n");
+        assert_eq!(parents(repo, &landed), [git(repo, &["rev-parse", "main"])]);
+        assert_eq!(git(&at("a"), &["rev-parse", "HEAD"]), local);
+        assert_eq!(made.lock().unwrap().pulls.len(), 1);
     }
 
     // A copy made from another has its files: no overlap until one changes them.
@@ -1320,4 +1354,91 @@ fn copies_come_back_and_follow_upstream() {
     // A named copy is mounted before its diff is read.
     sandfs.unmount("n.c").unwrap();
     assert!(gft.run(&home, &["diff", "c"]).contains("+noted differently"));
+}
+
+#[test]
+fn any_remote_takes_landings_and_gitlab_takes_merge_requests() {
+    if !mounts() {
+        return;
+    }
+    let upstream = tempfile::Builder::new().prefix("graft-upstream").tempdir().unwrap();
+    let repo = upstream.path();
+    git(repo, &["init", "-q"]);
+    git(repo, &["config", "uploadpack.allowFilter", "true"]);
+    std::fs::write(repo.join("README.md"), "one\ntwo\nthree\n").unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-q", "-m", "first"]);
+    let (api, made) = fake_github(repo);
+    let gft = Gft { sandfs_home: tempfile::tempdir().unwrap(), graft_home: tempfile::tempdir().unwrap(), api };
+    let work = tempfile::tempdir().unwrap();
+    let work = work.path().canonicalize().unwrap();
+    let url = format!("file://{}", repo.display());
+
+    // No forge: landing pushes the branch, and nothing else.
+    let got = gft.run(&work, &["get", &url, "plain"]);
+    assert!(got.contains("(main)"), "{got}");
+    let home = work.join("plain");
+    gft.run(&home, &["new", "fix"]);
+    let fix = work.join("plain+fix");
+    std::fs::write(fix.join("README.md"), "one\ntwo, fixed\nthree\n").unwrap();
+    assert!(gft.run(&fix, &["land", "-n"]).contains("pull request  new or open one, against main"));
+    let landed = gft.run(&fix, &["land", "-m", "Fix two"]);
+    let one = branch(repo, "graft/fix");
+    assert_eq!(landed, format!("graft/fix at {}, 1 file\n", &one[..10]));
+    assert_eq!(file_at(repo, &one, "README.md").unwrap(), "one\ntwo, fixed\nthree\n");
+    assert!(made.lock().unwrap().pulls.is_empty());
+    assert!(String::from_utf8_lossy(&gft.try_run(&fix, &["land"]).stderr).contains("nothing new to land"));
+    // Merged on the remote by hand (squashed, say): sync sees its files there, takes
+    // the merge in without a conflict, and the next landing starts a new branch.
+    std::fs::write(repo.join("README.md"), "one\ntwo, fixed\nthree\n").unwrap();
+    git(repo, &["commit", "-q", "-am", "Fix two (squashed)"]);
+    commit_upstream(repo, "other.txt", "other\n");
+    let synced = gft.run(&fix, &["sync"]);
+    assert!(synced.contains("graft/fix is in main (main has its files)"), "{synced}");
+    assert!(!synced.contains("conflict"), "{synced}");
+    assert_eq!(gft.run(&fix, &["changes"]), "");
+    // Its branch goes when asked, and only while it is where the landing left it.
+    let removed = gft.run(&home, &["rm", "--delete-branch", "fix"]);
+    assert!(removed.contains("fix: never landed, so no branch"), "{removed}");
+    gft.run(&home, &["new", "keep"]);
+    std::fs::write(work.join("plain+keep/keep.txt"), "keep\n").unwrap();
+    gft.run(&work.join("plain+keep"), &["land"]);
+    push_there(repo, "graft/keep", "theirs.txt", "theirs\n");
+    let removed = gft.run(&home, &["rm", "--delete-branch", "keep"]);
+    assert!(removed.contains("keep: kept branch graft/keep: it has commits this copy didn't land"), "{removed}");
+    gft.run(&home, &["new", "gone"]);
+    std::fs::write(work.join("plain+gone/gone.txt"), "gone\n").unwrap();
+    gft.run(&work.join("plain+gone"), &["land"]);
+    let removed = gft.run(&home, &["rm", "--delete-branch", "gone"]);
+    assert!(removed.contains("gone: deleted branch graft/gone"), "{removed}");
+    assert!(!branches(repo).contains_key("graft/gone"));
+    gft.run(&work, &["drop", "plain", "--force"]);
+
+    // GitLab: the same landing, with a merge request.
+    gft.run(&work, &["get", &url, "lab", "--forge", "gitlab:o/n"]);
+    let home = work.join("lab");
+    gft.run(&home, &["new", "notes"]);
+    let notes = work.join("lab+notes");
+    std::fs::write(notes.join("notes.txt"), "notes\n").unwrap();
+    let landed = gft.run(&notes, &["land", "-m", "Add notes", "--draft"]);
+    assert!(landed.contains("https://gitlab.com/o/n/-/merge_requests/1"), "{landed}");
+    {
+        let made = made.lock().unwrap();
+        assert_eq!(made.pulls[0]["title"], "Draft: Add notes");
+        assert_eq!(made.pulls[0]["base"], "main");
+    }
+    let preview = gft.run(&notes, &["land", "-n"]);
+    assert!(preview.contains("merge request https://gitlab.com/o/n/-/merge_requests/1 (updated)"), "{preview}");
+    std::fs::write(notes.join("notes.txt"), "notes, more\n").unwrap();
+    gft.run(&notes, &["land", "--body", "More."]);
+    assert_eq!(made.lock().unwrap().patches, [(1, json!("More.\n\nLanded with `gft land` from the copy `notes`."))]);
+    // Merged there: sync says so, and landing after starts a new merge request.
+    let merge = commit_upstream(repo, "notes.txt", "notes, more\n");
+    merge_pull(&mut made.lock().unwrap(), 1, &merge);
+    let synced = gft.run(&notes, &["sync"]);
+    assert!(synced.contains("merge request #1 was merged; notes lands next as a new one"), "{synced}");
+    std::fs::write(notes.join("notes.txt"), "notes, more, again\n").unwrap();
+    let landed = gft.run(&notes, &["land"]);
+    assert!(landed.contains("graft/notes-2 at ") && landed.contains("merge_requests/2"), "{landed}");
+    assert_eq!(parents(repo, &branch(repo, "graft/notes-2")), [merge]);
 }
